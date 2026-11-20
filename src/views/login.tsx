@@ -1,13 +1,13 @@
 import { Layout } from './layout';
 
 export const LoginPage = ({ error }: { error?: string }) => (
-  <Layout title="Sign in · Shop Tracker">
-    <header class="top"><span class="brand">Shop Tracker</span></header>
+  <Layout title="Sign in · Home Projects">
+    <header class="top"><span class="brand">Home Projects</span></header>
     <main>
       <form class="card login" method="post" action="/login">
         <h1>Sign in</h1>
         {error && <p class="note err">{error}</p>}
-        <label class="f"><span>Shop password</span>
+        <label class="f"><span>Password</span>
           <input type="password" name="password" autocomplete="current-password" required autofocus />
         </label>
         <p><button class="btn primary" type="submit">Sign in</button></p>
@@ -18,8 +18,8 @@ export const LoginPage = ({ error }: { error?: string }) => (
 
 /** Shown instead of the app when the server is missing its password. */
 export const SetupPage = () => (
-  <Layout title="Setup needed · Shop Tracker">
-    <header class="top"><span class="brand">Shop Tracker</span></header>
+  <Layout title="Setup needed · Home Projects">
+    <header class="top"><span class="brand">Home Projects</span></header>
     <main>
       <div class="card login">
         <h1>Setup needed</h1>

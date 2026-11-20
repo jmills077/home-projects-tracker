@@ -1,19 +1,17 @@
 {
   "name": "home-projects-tracker",
-  "version": "2.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "Quotes, scheduling and to-do lists for a custom furniture shop. Runs on Cloudflare Workers + D1.",
+  "description": "Planning and cost tracking for house projects and hobby woodworking builds. Runs on Cloudflare Workers + D1.",
   "type": "module",
   "scripts": {
     "build:client": "esbuild src/client/app.ts --bundle --minify --format=esm --target=es2022 --outfile=public/app.js",
     "dev": "wrangler dev",
-    "setup:local": "npm run db:migrate:local && npm run db:seed:local",
+    "setup:local": "npm run db:migrate:local",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "db:seed:local": "node scripts/seed-prices.ts && wrangler d1 execute DB --local --file=.wrangler/seed-prices.sql",
-    "db:seed:remote": "node scripts/seed-prices.ts && wrangler d1 execute DB --remote --file=.wrangler/seed-prices.sql",
     "deploy": "npm run db:migrate:remote && wrangler deploy",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p src/client && tsc --noEmit -p scripts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/client",
     "db:reset:local": "rm -rf .wrangler/state && npm run setup:local"
   },
   "repository": {

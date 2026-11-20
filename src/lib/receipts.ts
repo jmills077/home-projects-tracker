@@ -1,4 +1,4 @@
-// Reads a photo of a store receipt with Workers AI (a vision model on the shop's Cloudflare account,
+// Reads a photo of a store receipt with Workers AI (a vision model on the site's Cloudflare account,
 // so there is no separate API key) and returns its line items for the browser to check over.
 import type { Env } from '../env';
 import type { ScannedReceipt } from '../shared/types';
@@ -98,13 +98,13 @@ export async function keepPhoto(db: D1Database, id: unknown, image: string) {
 }
 
 /** Saves what a receipt says (store, date, total, tax, notes), creating it without a photo if it's new.
- *  `general` (its lines that are general business expenses) is replaced only when it's sent. */
+ *  `general` (its lines that aren't for any one project) is replaced only when it's sent. */
 export async function saveReceipt(db: D1Database, r: any) {
   const text = (v: unknown, n: number) => String(v ?? '').trim().slice(0, n);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(String(r?.date)) ? String(r.date) : '';
   let general: string | null = null;
   if (r?.general !== undefined) {
-    if (!Array.isArray(r.general) || r.general.length > 300) throw new ReceiptError('Malformed general expense lines.');
+    if (!Array.isArray(r.general) || r.general.length > 300) throw new ReceiptError('Malformed receipt lines.');
     general = JSON.stringify(r.general.map((l: any) => ({ id: text(l?.id, 40), item: text(l?.item, 300), qty: money(l?.qty) || 1, amount: money(l?.amount) }))
       .filter((l: GeneralLine) => l.id && l.item));
   }
@@ -139,6 +139,6 @@ export async function deleteReceipt(db: D1Database, id: unknown) {
     WHERE json_extract(x.value, '$.receipt') = ? LIMIT 1`).bind(id).first();
   if (used) throw new ReceiptError('Lines from this receipt are still on a project. Remove them from the project first.');
   const general = await db.prepare(`SELECT 1 FROM receipts WHERE id = ? AND general != '[]'`).bind(id).first();
-  if (general) throw new ReceiptError('This receipt has general business expenses on it. Remove them first.');
+  if (general) throw new ReceiptError("This receipt has lines that aren't for a project. Remove them first.");
   await db.prepare('DELETE FROM receipts WHERE id = ?').bind(id).run();
 }

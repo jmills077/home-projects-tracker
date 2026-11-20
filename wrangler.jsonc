@@ -1,5 +1,5 @@
-// Cloudflare Workers configuration for Shop Tracker.
-// `npm run dev` runs all of this locally (D1 and the cron are simulated on your machine);
+// Cloudflare Workers configuration for Home Projects Tracker.
+// `npm run dev` runs all of this locally (D1 is simulated on your machine);
 // `npm run deploy` publishes it. See DEPLOYMENT.md.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
@@ -30,10 +30,7 @@
 
   // Workers AI, for reading receipt photos. Even under `npm run dev` this runs on Cloudflare
   // (so it needs `npx wrangler login`); everything else stays local.
-  "ai": { "binding": "AI", "remote": true },
+  "ai": { "binding": "AI", "remote": true }
 
-  // Weekly supplier price check: Mondays, about 5 am Eastern.
-  "triggers": { "crons": ["17 9 * * 1"] }
-
-  // Secrets (not in this file): APP_PASSWORD, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET. Locally, put them in .dev.vars.
+  // Secrets (not in this file): APP_PASSWORD. Locally, put them in .dev.vars.
 }

@@ -4,19 +4,15 @@
 export interface Settings { species: unknown[]; [key: string]: unknown }
 
 export interface Project {
-  id: number; quote_number: string;
-  stream: string;                     // 'client' (custom work for a client), 'product' (product line) or 'gallery' (not for sale)
+  id: number;
+  stream: string;                     // 'home' (home improvement) or 'shop' (a shop build)
   status: string; stage: string;
-  data: Record<string, unknown>;      // client, spec, rates, phases, lumber, design notes, due dates; `frozen` while on hold
-  calc: Record<string, unknown>;      // priced totals
-  todoist: Record<string, unknown>;   // left over from the old Todoist hand-off; no longer used, kept so old data isn't lost
+  data: Record<string, unknown>;      // name, budget, lumber, design notes, lists, purchases, due dates; `frozen` while on hold
+  calc: Record<string, unknown>;      // totals as of the last save
   history: { status?: string; stage?: string; at: string }[];
   created_at: string; updated_at: string;
 }
 
-export interface PriceItem { id: string; list: string; species: string; size: string; wide: string; spec: string; price: number }
-/** The supplier price list, as the browser app has always read it. */
-export interface Prices { source: string; checked: string; items: PriceItem[] }
 
 /** What a receipt photo was read as (src/lib/receipts.ts). The browser lets you check items over before saving. */
 export interface ScannedReceipt {

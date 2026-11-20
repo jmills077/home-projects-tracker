@@ -1,7 +1,7 @@
 {
-  "name": "JM Woodwork Shop Tracker",
-  "short_name": "Shop Tracker",
-  "description": "Quotes, scheduling and to-do lists for JM Woodwork.",
+  "name": "Home Projects Tracker",
+  "short_name": "Home Projects",
+  "description": "Planning and cost tracking for house projects and shop builds.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
