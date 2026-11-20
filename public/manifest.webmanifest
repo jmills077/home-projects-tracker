@@ -1,12 +1,12 @@
 {
-  "name": "JM Woodwork Shop Tracker",
-  "short_name": "Shop Tracker",
-  "description": "Quotes, scheduling and to-do lists for JM Woodwork.",
+  "name": "Home Projects Tracker",
+  "short_name": "Home Projects",
+  "description": "Planning and cost tracking for house projects and shop builds.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#faf5ec",
-  "theme_color": "#a63a2b",
+  "background_color": "#f4f5ef",
+  "theme_color": "#3f6b57",
   "icons": [
     {
       "src": "/icon-192.png",

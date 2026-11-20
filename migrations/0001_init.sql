@@ -1,8 +1,8 @@
--- Shop Tracker schema.
+-- Home Projects Tracker schema.
 --
--- Projects keep the quote's working details (client, spec, rates, phases, lumber, design notes,
--- due dates) as one JSON document in `data`, the same shape as the old in-browser app and its
--- backup files, so backups import unchanged. Columns the pages sort and filter on sit beside it.
+-- A project keeps its working details (what it is, budget, lumber, design notes, to-do and shopping
+-- lists, cut list, purchases, due dates) as one JSON document in `data`. Columns the pages sort and
+-- filter on sit beside it.
 
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,
@@ -11,26 +11,31 @@ CREATE TABLE settings (
 
 CREATE TABLE projects (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  quote_number TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'draft',
-  stage TEXT NOT NULL DEFAULT 'ideation',
-  data TEXT NOT NULL,            -- JSON: what is being built and how it is priced
-  calc TEXT NOT NULL,            -- JSON: priced totals as of the last save
-  todoist TEXT NOT NULL DEFAULT '{}',   -- JSON: progress creating the job's Todoist project
+  stream TEXT NOT NULL DEFAULT 'home',      -- 'home' (home improvement) or 'shop' (a shop build)
+  status TEXT NOT NULL DEFAULT 'planned',   -- planned, in_progress, complete
+  stage TEXT NOT NULL DEFAULT 'ideation',   -- ideation, design, build, install
+  data TEXT NOT NULL,            -- JSON: the project's details
+  calc TEXT NOT NULL DEFAULT '{}',      -- JSON: totals worked out by the browser as of the last save
   history TEXT NOT NULL DEFAULT '[]',   -- JSON: status and phase changes, oldest first
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX projects_status ON projects (status);
 
--- Parkerville Wood Products' price lists, refreshed weekly by the Worker's cron trigger.
-CREATE TABLE price_items (
-  id TEXT PRIMARY KEY,
-  position INTEGER NOT NULL,     -- order on the supplier's list
-  list TEXT NOT NULL,            -- 'domestic' or 'exotic'
-  species TEXT NOT NULL,
-  size TEXT NOT NULL,
-  wide TEXT NOT NULL,
-  spec TEXT NOT NULL,
-  price REAL NOT NULL            -- $ per board foot
+-- Every receipt photo. Line items for a project live with that project (data.purchases, each naming
+-- its receipt by id), since one receipt can be split across projects; lines that aren't for any one
+-- project live here, in `general`.
+-- The photo is a JPEG as base64 text (about 0.3-1 MB each; a D1 row holds up to 2 MB).
+CREATE TABLE receipts (
+  id TEXT PRIMARY KEY,                 -- made by the browser, e.g. r<time in base 36>
+  store TEXT NOT NULL DEFAULT '',
+  date TEXT NOT NULL DEFAULT '',       -- purchase date, YYYY-MM-DD
+  total REAL NOT NULL DEFAULT 0,       -- the receipt's total as printed (or entered)
+  tax REAL NOT NULL DEFAULT 0,
+  notes TEXT NOT NULL DEFAULT '',      -- what was bought and why, typed in when scanning
+  general TEXT NOT NULL DEFAULT '[]',  -- JSON: lines not for any one project: [{ id, item, qty, amount }]
+  mime TEXT NOT NULL DEFAULT '',       -- '' when there is no photo (a purchase entered by hand)
+  image TEXT NOT NULL DEFAULT '',      -- base64
+  created_at TEXT NOT NULL
 );
+CREATE INDEX receipts_date ON receipts (date);

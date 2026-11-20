@@ -1,248 +1,76 @@
-// Shop Tracker in the browser: every page is drawn here from the shop's data, which the server
+// Home Projects Tracker in the browser: every page is drawn here from the projects, which the server
 // embeds in the page and saves to the database. See README.md for how the pieces fit together.
 import { workbook, type Cell, type Sheet } from './xlsx';
 import { readSkp, readCutCsv, readPieceLine, fmtInches, type Piece } from './skp';
 
-// ---------- estimating model ----------
-// Baseline hours per phase at a reference size (inches, L x W x H). Hours are
-// scaled by the piece's size, species, joinery complexity and finish. Tune
-// these to how long things take in your shop, or use "Shop speed" in Settings
-// to scale everything at once. "solid" is the share of the bounding box that
-// is actual lumber, used for the board-foot estimate.
-const TYPES = {
-  dining_table: { name: 'Dining table', ref: [72, 38, 30], design: 2, milling: 5, joinery: 8, sanding: 4, finishing: 5, solid: 0.085 },
-  coffee_table: { name: 'Coffee table', ref: [48, 24, 18], design: 1.5, milling: 3, joinery: 5, sanding: 2.5, finishing: 3, solid: 0.12 },
-  end_table: { name: 'End table / nightstand', ref: [22, 22, 24], design: 1, milling: 2, joinery: 4, sanding: 1.5, finishing: 2, solid: 0.12 },
-  desk: { name: 'Desk', ref: [60, 30, 30], design: 2, milling: 4.5, joinery: 8, sanding: 3.5, finishing: 4, solid: 0.10 },
-  bookshelf: { name: 'Bookshelf', ref: [36, 12, 72], design: 1.5, milling: 4, joinery: 6, sanding: 3.5, finishing: 4, solid: 0.15 },
-  cabinet: { name: 'Cabinet / sideboard', ref: [36, 20, 34], design: 2, milling: 4, joinery: 8, sanding: 3, finishing: 4, solid: 0.22 },
-  dresser: { name: 'Dresser', ref: [60, 20, 34], design: 2.5, milling: 6, joinery: 10, sanding: 4, finishing: 5, solid: 0.22 },
-  bed_frame: { name: 'Bed frame', ref: [82, 62, 40], design: 2, milling: 5, joinery: 8, sanding: 4, finishing: 5, solid: 0.035 },
-  bench: { name: 'Bench', ref: [48, 14, 18], design: 1, milling: 2.5, joinery: 4, sanding: 2, finishing: 2.5, solid: 0.20 },
-  chair: { name: 'Chair', ref: [18, 18, 36], design: 2, milling: 3, joinery: 9, sanding: 3, finishing: 2.5, solid: 0.12 },
-  cutting_board: { name: 'Cutting board', ref: [18, 12, 1.5], design: 0.25, milling: 1, joinery: 1, sanding: 1, finishing: 0.75, solid: 1.1 },
-  custom: { name: 'Other / custom', ref: [48, 24, 30], design: 2, milling: 4, joinery: 6, sanding: 3, finishing: 3.5, solid: 0.12 },
-};
-const COMPLEXITY = {
-  simple: { name: 'Simple (pocket screws, dominos, straight lines)', factor: 0.8 },
-  standard: { name: 'Standard (mortise & tenon, dados)', factor: 1.0 },
-  complex: { name: 'Complex (dovetails, curves, tapers)', factor: 1.35 },
-  heirloom: { name: 'Heirloom (hand-cut joinery, inlay, carving)', factor: 1.75 },
-};
-const FINISHES = {
-  none: { name: 'Unfinished', factor: 0 },
-  oil: { name: 'Oil', factor: 0.7 },
-  hardwax: { name: 'Hardwax oil', factor: 0.8 },
-  poly: { name: 'Polyurethane', factor: 1.0 },
-  lacquer: { name: 'Sprayed lacquer', factor: 1.1 },
-  stain_topcoat: { name: 'Stain + topcoat', factor: 1.3 },
-  paint: { name: 'Paint', factor: 1.3 },
-};
-const HOURS_PER_DRAWER = 2.5, HOURS_PER_DOOR = 2.0, HOURS_PER_SHELF = 0.4;
-const PHASES = [
-  ['design', 'Design & shop drawings'],
-  ['milling', 'Milling & stock prep'],
-  ['joinery', 'Joinery & assembly'],
-  ['fitted', 'Drawers, doors & shelves'],
-  ['sanding', 'Sanding & surface prep'],
-  ['finishing', 'Finishing'],
-  ['delivery', 'Delivery & install'],
-];
-const STATUSES = [
-  ['draft', 'Draft'], ['sent', 'Quote sent'], ['accepted', 'Accepted'], ['in_progress', 'In progress'],
-  ['complete', 'Complete'], ['delivered', 'Delivered & paid'], ['declined', 'Declined'],
-];
-// Product-line and gallery pieces have no client or quote, so their status is just where the work is.
-const OWN_STATUSES = [['planned', 'Planned'], ['in_progress', 'In progress'], ['complete', 'Complete']];
-const STATUS_NAME = Object.fromEntries([...STATUSES, ...OWN_STATUSES]);
-// The three streams of work. Projects from before streams existed are client work.
+// ---------- what a project is ----------
+// Two streams of work: projects on the house, and pieces built in the shop for the home.
 const STREAMS = [
-  ['client', 'Client custom', 'A piece quoted for a client.'],
-  ['product', 'Product line', 'One of your own products, priced for sale.'],
-  ['gallery', 'Gallery', 'A piece made for the business, not for sale.'],
+  ['home', 'Home improvement', 'Work on the house: a remodel, a repair, an upgrade.'],
+  ['shop', 'Shop builds', 'A piece built in the shop for the home: a dresser, a cabinet, a table.'],
 ];
 const STREAM_NAME = Object.fromEntries(STREAMS);
 // Shorter tab names for the Projects page on phones.
-const STREAM_SHORT = { all: 'All', client: 'Client', product: 'Product', gallery: 'Gallery' };
-const streamOf = p => STREAM_NAME[p.stream] ? p.stream : 'client';
-const isClient = p => streamOf(p) === 'client';
-const statusesFor = stream => stream === 'client' ? STATUSES : OWN_STATUSES;
-// Delivered and declined client projects, and finished product and gallery pieces, leave the board for the archive.
-const archived = p => isClient(p) ? ['delivered', 'declined'].includes(p.status) : p.status === 'complete';
-// A frozen project is on hold: the client went quiet but may come back, or the job hit a long delay.
-// It keeps its status, phase and dates, but leaves the board and calendar for the Frozen list
-// until it is unfrozen. data.frozen is { at, reason }.
+const STREAM_SHORT = { all: 'All', home: 'Home', shop: 'Shop' };
+const streamOf = p => STREAM_NAME[p.stream] ? p.stream : 'home';
+// Where the work is. A complete project leaves the board for the archive.
+const STATUSES = [['planned', 'Planned'], ['in_progress', 'In progress'], ['complete', 'Complete']];
+const STATUS_NAME = Object.fromEntries(STATUSES);
+const archived = p => p.status === 'complete';
+// A frozen project is on hold: waiting on a contractor, the weather or the budget. It keeps its status,
+// phase and dates, but leaves the board and calendar for the Frozen list until it is unfrozen.
+// data.frozen is { at, reason }.
 const isFrozen = p => !!p.data?.frozen;
-// A status from one stream carried over to another when a project changes stream.
-const STATUS_IN_STREAM = {
-  client: { planned: 'draft' },
-  own: { draft: 'planned', sent: 'planned', declined: 'planned', accepted: 'planned', delivered: 'complete' },
-};
-// The phase of the work itself, tracked separately from the quote/job status above.
-// Client and gallery pieces go through all five phases. Product-line pieces are already designed, so they
-// go Building, Finishing, Packaging, and then Shipped, which closes the project out (status Complete).
-const STAGES = [['ideation', 'Ideation'], ['design', 'Design'], ['build', 'Build'], ['finishing', 'Finishing'], ['ready', 'Delivery']];
-const PRODUCT_STAGES = [['building', 'Building'], ['finishing', 'Finishing'], ['packaging', 'Packaging'], ['shipped', 'Shipped']];
-const STAGE_NAME = Object.fromEntries([...STAGES, ...PRODUCT_STAGES]);
-const isProduct = p => streamOf(p) === 'product';
-const stagesFor = p => isProduct(p) ? PRODUCT_STAGES : STAGES;
-// The phase whose due date is the project's target date: delivery, or for a product the ship-by date.
-const lastPhase = p => isProduct(p) ? 'packaging' : 'ready';
-// A phase from the other kind of stream, carried to the nearest one this stream has (old product-line
-// projects were in the five client phases, and a project can be moved between streams).
-const STAGE_IN_STREAM = {
-  product: { ideation: 'building', design: 'building', build: 'building', ready: 'packaging' },
-  other: { building: 'build', packaging: 'ready', shipped: 'ready' },
-};
-const stageOf = p => {
-  const list = stagesFor(p);
-  if (list.some(([key]) => key === p.stage)) return p.stage;
-  return STAGE_IN_STREAM[isProduct(p) ? 'product' : 'other'][p.stage] || list[0][0];
-};
-const stageIndex = p => stagesFor(p).findIndex(([key]) => key === stageOf(p));
-// Each phase after ideation has its own due date (Shipped has none: it is the ship-by date being met).
-// The last dated phase's is the project's target completion date.
-const stageDue = (p, key) => (key === lastPhase(p) ? p.data.due_date : key === 'ideation' || key === 'shipped' ? '' : p.data.stage_due?.[key]) || '';
-const NEXT_STEP = {
-  draft: ['sent', 'Mark quote as sent'], sent: ['accepted', 'Quote accepted'], accepted: ['in_progress', 'Start work'],
-  in_progress: ['complete', 'Mark complete'], complete: ['delivered', 'Delivered & paid'],
-};
-const OWN_NEXT_STEP = { planned: ['in_progress', 'Start work'], in_progress: ['complete', 'Mark complete'] };
-const STATES = [
-  ['AL', 'Alabama'], ['AK', 'Alaska'], ['AZ', 'Arizona'], ['AR', 'Arkansas'], ['CA', 'California'], ['CO', 'Colorado'], ['CT', 'Connecticut'],
-  ['DE', 'Delaware'], ['DC', 'District of Columbia'], ['FL', 'Florida'], ['GA', 'Georgia'], ['HI', 'Hawaii'], ['ID', 'Idaho'], ['IL', 'Illinois'],
-  ['IN', 'Indiana'], ['IA', 'Iowa'], ['KS', 'Kansas'], ['KY', 'Kentucky'], ['LA', 'Louisiana'], ['ME', 'Maine'], ['MD', 'Maryland'],
-  ['MA', 'Massachusetts'], ['MI', 'Michigan'], ['MN', 'Minnesota'], ['MS', 'Mississippi'], ['MO', 'Missouri'], ['MT', 'Montana'], ['NE', 'Nebraska'],
-  ['NV', 'Nevada'], ['NH', 'New Hampshire'], ['NJ', 'New Jersey'], ['NM', 'New Mexico'], ['NY', 'New York'], ['NC', 'North Carolina'],
-  ['ND', 'North Dakota'], ['OH', 'Ohio'], ['OK', 'Oklahoma'], ['OR', 'Oregon'], ['PA', 'Pennsylvania'], ['RI', 'Rhode Island'], ['SC', 'South Carolina'],
-  ['SD', 'South Dakota'], ['TN', 'Tennessee'], ['TX', 'Texas'], ['UT', 'Utah'], ['VT', 'Vermont'], ['VA', 'Virginia'], ['WA', 'Washington'],
-  ['WV', 'West Virginia'], ['WI', 'Wisconsin'], ['WY', 'Wyoming'],
-];
-const STATE_NAME = Object.fromEntries(STATES);
+// The phase of the work itself, tracked separately from the status above. Every project goes through
+// the same four. Each phase after Ideation has its own due date; Install's is the project's target date.
+const STAGES = [['ideation', 'Ideation'], ['design', 'Design'], ['build', 'Build'], ['install', 'Install']];
+const STAGE_NAME = Object.fromEntries(STAGES);
+const stagesFor = _p => STAGES;
+const lastPhase = _p => 'install';
+const stageOf = p => STAGE_NAME[p.stage] ? p.stage : 'ideation';
+const stageIndex = p => STAGES.findIndex(([key]) => key === stageOf(p));
+const stageDue = (p, key) => (key === 'install' ? p.data.due_date : key === 'ideation' ? '' : p.data.stage_due?.[key]) || '';
+const NEXT_STEP = { planned: ['in_progress', 'Start work'], in_progress: ['complete', 'Mark complete'] };
 const DEFAULT_SETTINGS = {
-  // Statewide sales tax rates (%), without city or county add-ons. Starting values only: edit them in Settings.
-  state_tax: {
-    AL: 4, AK: 0, AZ: 5.6, AR: 6.5, CA: 7.25, CO: 2.9, CT: 6.35, DE: 0, DC: 6, FL: 6, GA: 4, HI: 4, ID: 6, IL: 6.25, IN: 7, IA: 6, KS: 6.5,
-    KY: 6, LA: 5, ME: 5.5, MD: 6, MA: 6.25, MI: 6, MN: 6.875, MS: 7, MO: 4.225, MT: 0, NE: 5.5, NV: 6.85, NH: 0, NJ: 6.625, NM: 4.875,
-    NY: 4, NC: 4.75, ND: 5, OH: 5.75, OK: 4.5, OR: 0, PA: 6, RI: 7, SC: 6, SD: 4.2, TN: 7, TX: 6.25, UT: 6.1, VT: 6, VA: 5.3, WA: 6.5,
-    WV: 6, WI: 5, WY: 4,
-  },
-  business_name: '', business_contact: '',
-  quote_terms: '50% deposit to begin work, balance due on completion. Wood is a natural material; grain and color will vary.',
-  prices_checked: '',   // date of the supplier price list last applied to linked species
-  // The product line's catalog, for quick small-batch runs. Names, variants and prices are copied from the
-  // jmwood.work shop (see loadShopProducts); cost, time and materials per unit are filled in here.
-  // { id, handle, name, listed, variants: [{ name, price }], unit_cost, unit_hours, materials }
-  products: [],
-  hourly_rate: 65, design_retainer: 300, contingency_pct: 10, markup_pct: 20, tax_pct: 0, deposit_pct: 50, waste_pct: 25, shop_speed: 1, quote_valid_days: 30,
-  income_tax_pct: 7,   // share of a project's profit to set aside for taxes, on its Summary
-  // price is $ per board foot; labor is how much slower (or faster) the species is to work than cherry or walnut
+  household_name: '',
+  waste_pct: 20,   // extra lumber to buy over what the cut list adds up to, for defects and offcuts
+  // A rough price per board foot, for the lumber estimate on a project. Edit them in Settings.
   species: [
-    { name: 'Pine', price: 4, labor: 0.9 }, { name: 'Poplar', price: 5, labor: 0.9 }, { name: 'Red oak', price: 7, labor: 1 },
-    { name: 'White oak', price: 10, labor: 1.1 }, { name: 'Ash', price: 7, labor: 1.05 }, { name: 'Cherry', price: 9, labor: 1 },
-    { name: 'Hard maple', price: 8, labor: 1.15 }, { name: 'Walnut', price: 14, labor: 1 }, { name: 'African mahogany', price: 8.62, labor: 1 }, { name: 'South American mahogany', price: 10.99, labor: 1 },
-    { name: 'Hickory', price: 7, labor: 1.25 }, { name: 'Teak', price: 35, labor: 1.2 },
+    { name: 'Pine', price: 4 }, { name: 'Poplar', price: 5 }, { name: 'Red oak', price: 7 }, { name: 'White oak', price: 10 },
+    { name: 'Ash', price: 7 }, { name: 'Cherry', price: 9 }, { name: 'Hard maple', price: 8 }, { name: 'Walnut', price: 14 },
+    { name: 'Hickory', price: 7 },
   ],
 };
 
 const num = (v, d = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
 const pos = v => Math.max(num(v), 0);
-const quarter = h => Math.round(Math.max(h, 0) * 4) / 4;
 const cents = n => Math.round(n * 100) / 100;
-const findSpecies = name => store.settings.species.find(s => s.name === name) || { name: name || '', price: 0, labor: 1 };
+const findSpecies = name => store.settings.species.find(s => s.name === name) || { name: name || '', price: 0 };
 
-function estimate(spec) {
-  const t = TYPES[spec.type] || TYPES.custom;
-  const [rl, rw, rh] = t.ref;
-  const l = pos(spec.length) || rl, w = pos(spec.width) || rw, h = pos(spec.height) || rh;
-  // Work grows with surface area, but not linearly: setup time is fixed.
-  const size = Math.min(Math.max(((l * w + l * h + w * h) / (rl * rw + rl * rh + rw * rh)) ** 0.6, 0.4), 3.5);
-  const sp = num(findSpecies(spec.species).labor, 1) || 1;
-  const cx = (COMPLEXITY[spec.complexity] || COMPLEXITY.standard).factor;
-  const fin = (FINISHES[spec.finish] || FINISHES.oil).factor;
-  const speed = num(store.settings.shop_speed, 1) || 1;
-  const fitted = pos(spec.drawers) * HOURS_PER_DRAWER * (1 + (cx - 1) * 0.5)
-    + pos(spec.doors) * HOURS_PER_DOOR * (1 + (cx - 1) * 0.5)
-    + pos(spec.shelves) * HOURS_PER_SHELF;
-  const hours = {
-    design: t.design * cx * (0.7 + 0.3 * size) * speed,
-    milling: t.milling * size * sp * (1 + (cx - 1) * 0.3) * speed,
-    joinery: t.joinery * Math.sqrt(size) * cx * sp * speed,
-    fitted: fitted * sp * speed,
-    sanding: t.sanding * size * (1 + (sp - 1) * 0.5) * speed,
-    finishing: t.finishing * size * fin * speed,
-    delivery: pos(spec.delivery_hours),
-  };
-  const waste = 1 + pos(store.settings.waste_pct) / 100;
-  return {
-    phases: PHASES.map(([key, name]) => ({ key, name, est_hours: quarter(hours[key]) })),
-    boardFeet: Math.round(l * w * h / 144 * t.solid * waste * 10) / 10,
-  };
+// Totals the pages show, worked out from the project: its budget, what's been spent so far (every
+// purchase on it, from receipts or typed in) and the lumber it needs. Kept on the project as `calc`.
+function totals(p) {
+  const budget = pos(p.data.budget), spent = spentOn(p);
+  return { budget, spent, left: cents(budget - spent), board_feet: cutBoardFeet(p), hours: pos(p.data.hours_worked) };
+}
+// Board feet on the cut list, plus the waste allowance: what to buy if nothing else is typed in.
+function cutBoardFeet(p) {
+  const bf = (p.data.cutlist?.items || []).reduce((n, x) => n + bdFt(x), 0);
+  return Math.round(bf * (1 + pos(store.settings.waste_pct) / 100) * 10) / 10;
 }
 
-// Refresh estimated phases while keeping hand-edited hours and custom tasks.
-function mergePhases(existing = [], estimated) {
-  const merged = [];
-  for (const est of estimated) {
-    const old = existing.find(p => p.key === est.key);
-    if (old && old.manual) merged.push({ ...est, hours: pos(old.hours), manual: true });
-    else if (est.est_hours > 0) merged.push({ ...est, hours: est.est_hours });
-  }
-  return merged.concat(existing.filter(p => p.custom));
-}
-
-// The price agreed with the client (or set for a product), or null to use the estimate.
-const agreedPrice = (data, stream) => stream === 'gallery' || data.final_price === '' || data.final_price == null ? null : pos(data.final_price);
-
-// Re-estimates data.phases in place and returns the priced totals. Only client work has sales tax,
-// a retainer and a deposit; a gallery piece is priced at cost, so its materials carry no markup.
-// An agreed final price replaces the estimated total (sales tax included); the estimate is kept
-// alongside it as estimate_total.
-function price(data, stream = 'client') {
-  const est = estimate(data.spec);
-  data.phases = mergePhases(data.phases, est.phases);
-  const r = data.rates;
-  const laborHours = data.phases.reduce((sum, p) => sum + pos(p.hours), 0);
-  const contingencyHours = cents(laborHours * pos(r.contingency_pct) / 100);
-  const laborCost = (laborHours + contingencyHours) * pos(r.hourly_rate);
-  // Lumber is bought as whole boards, so the cost is for what has to be purchased, not just what is used.
-  const lumber = lumberNeeds(data, est.boardFeet);
-  const materialsEst = lumber.buyBf * pos(findSpecies(data.spec.species).price);
-  const materialsBase = data.materials_override === '' || data.materials_override == null ? materialsEst : pos(data.materials_override);
-  const otherCosts = pos(data.other_costs);
-  const client = stream === 'client', markup = stream === 'gallery' ? 0 : pos(r.markup_pct);
-  const estSubtotal = laborCost + materialsBase * (1 + markup / 100) + otherCosts;
-  const estTotal = estSubtotal + (client ? estSubtotal * pos(r.tax_pct) / 100 : 0);
-  const agreed = agreedPrice(data, stream);
-  const total = agreed ?? estTotal;
-  // With an agreed price, the tax shown is the part of that price that is sales tax.
-  const subtotal = agreed == null ? estSubtotal : client ? total / (1 + pos(r.tax_pct) / 100) : total;
-  const tax = total - subtotal;
-  const retainer = client ? Math.min(pos(data.retainer), total) : 0;
-  const balance = total - retainer;
-  return {
-    board_feet: est.boardFeet, lumber, labor_hours: cents(laborHours), contingency_hours: contingencyHours, labor_cost: cents(laborCost),
-    materials_est: cents(materialsEst), materials_cost: cents(materialsBase * (1 + markup / 100)), other_costs: cents(otherCosts),
-    cost: cents(laborCost + materialsBase + otherCosts),   // what the piece costs the shop: time, lumber and hardware
-    subtotal: cents(subtotal), tax: cents(tax), total: cents(total),
-    estimate_total: cents(estTotal), agreed: agreed != null,
-    retainer: cents(retainer), balance: cents(balance), deposit: client ? cents(balance * pos(r.deposit_pct) / 100) : 0,
-  };
-}
-
-// ---------- storage (the shop's database, through the server) ----------
-// The page arrives with the shop's data embedded in it; changes are sent back to the server.
+// ---------- storage (the database, through the server) ----------
+// The page arrives with the projects embedded in it; changes are sent back to the server.
 let store = loadStore(JSON.parse(document.getElementById('initialState').textContent));
 
 function loadStore(saved: any) {
   return {
     settings: { ...structuredClone(DEFAULT_SETTINGS), ...(saved.settings || {}) },
     projects: Array.isArray(saved.projects) ? saved.projects : [],
-    shopifyConnected: !!saved.shopifyConnected,   // whether the server can read the shop's orders (the SHOPIFY_* secrets)
     settingsUpdatedAt: saved.settingsUpdatedAt || '',
   };
 }
-// Save a change to the shop's data.
+// Save a change.
 let changeSeq = 0;
 function persist() {
   changeSeq++;
@@ -276,7 +104,9 @@ function setPath(obj, path, value) {
   keys.reduce((o, k) => o[k], obj)[last] = value;
 }
 const inputValue = el => el.type === 'number' ? (el.value === '' ? '' : num(el.value)) : el.value;
-const projectName = p => p.data.batch ? `${p.data.title} × ${batchUnits(p.data.batch)}` : p.data.title || TYPES[p.data.spec.type].name;
+const projectName = p => p.data.title || 'Untitled project';
+// The line under a project's name in lists: the room it's in, or the wood a shop build is made of.
+const whereOf = p => [p.data.area, p.data.species].filter(Boolean).join(' \u00b7 ') || STREAM_NAME[streamOf(p)];
 
 let toastTimer;
 function toast(message) {
@@ -285,68 +115,6 @@ function toast(message) {
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 4000);
-}
-
-// ---------- supplier lumber prices ----------
-// A weekly job on the server reads Parkerville Wood Products' price lists into the database.
-// A species linked to one of its items in Settings takes that item's price per board foot.
-const PRICE_FEED = '/api/prices';
-const AUTO_LINK = {
-  'Pine': 'Pine, Eastern White (Clear)', 'Poplar': 'Poplar', 'Red oak': 'Oak, Red', 'White oak': 'Oak, White (PS)', 'Ash': 'Ash',
-  'Cherry': 'Cherry', 'Hard maple': 'Maple, Hard', 'Walnut': 'Walnut, Black', 'Hickory': 'Hickory', 'Teak': 'Teak',
-  'African mahogany': 'Mahogany, African', 'South American mahogany': 'Mahogany, South American',
-};
-let feed = null;
-
-async function loadPrices() {
-  try {
-    const res = await fetch(PRICE_FEED, { cache: 'no-cache' });
-    const data = res.ok ? await res.json() : null;
-    if (!data || !Array.isArray(data.items)) return;
-    feed = data;
-  } catch { return; }
-  if (applyPrices() && !(ed && !ed.project)) route();
-}
-
-// The standard pick for a species: 4/4, regular width, top grade where one is listed.
-function defaultItem(species) {
-  const items = feed.items.filter(i => i.species === species);
-  const regular = items.filter(i => i.size === '4/4' && !i.wide);
-  return regular.find(i => i.spec.includes('FAS')) || regular[0] || items[0];
-}
-
-// Returns true if any setting changed. Prices only move forward to a newer list, so a device
-// still holding last week's list can't undo an update another device has already saved.
-function applyPrices() {
-  if (!feed) return false;
-  const settings = store.settings, fresh = feed.checked > (settings.prices_checked || '');
-  let changed = false;
-  if (!(settings.species_rev >= 1)) {
-    // One-time change to species lists saved earlier: the generic "Mahogany" becomes African and South American.
-    const old = settings.species.findIndex(sp => sp.name === 'Mahogany');
-    const added = [['African mahogany', 8.62], ['South American mahogany', 10.99]]
-      .filter(([name]) => !settings.species.some(sp => sp.name === name)).map(([name, price]) => ({ name, price, labor: 1 }));
-    settings.species.splice(old < 0 ? settings.species.length : old, old < 0 ? 0 : 1, ...added);
-    // Quotes that used the generic entry move to South American, the closer of the two in price.
-    for (const p of store.projects.filter(p => old >= 0 && p.data.spec.species === 'Mahogany')) {
-      p.data.spec.species = 'South American mahogany';
-      p.updated_at = new Date().toISOString();
-    }
-    settings.species_rev = 1;
-    changed = true;
-  }
-  for (const sp of settings.species) {
-    let linkedNow = false;
-    if (sp.source === undefined) {   // first time: link the species that have an obvious match
-      sp.source = (AUTO_LINK[sp.name] && defaultItem(AUTO_LINK[sp.name])?.id) || '';
-      linkedNow = changed = true;
-    }
-    const item = feed.items.find(i => i.id === sp.source);
-    if (item && (fresh || linkedNow) && sp.price !== item.price) { sp.price = item.price; changed = true; }
-  }
-  if (fresh) { settings.prices_checked = feed.checked; changed = true; }
-  if (changed) settingsChanged();
-  return changed;
 }
 
 // ---------- saving to the server (shared by every device) ----------
@@ -433,13 +201,11 @@ async function refresh() {
   // Something was edited while the request was out: leave it for the next refresh.
   if (seq !== changeSeq || saving || pendingChanges().any) return;
   const next = loadStore(remote);
-  store.shopifyConnected = next.shopifyConnected;
   if (JSON.stringify([next.settings, next.projects], unbusy) === JSON.stringify([store.settings, store.projects], unbusy)) return;
   store = next;
   saved = snapshot();
-  applyPrices();
   backfillTodos();
-  // Redraw from the new data, unless a not-yet-saved quote is being written.
+  // Redraw from the new data, unless a not-yet-saved project is being written.
   if (!(ed && !ed.project)) route();
 }
 
@@ -455,7 +221,6 @@ function sectionOf(hash) {
   if (parts[0] === 'calendar') return 'Calendar';
   if (parts[0] === 'frozen') return 'Frozen projects';
   if (parts[0] === 'receipts') return 'All receipts';
-  if (parts[0] === 'products') return 'Shop products';
   if (parts[0] === 'tasks') return parts[1] === 'shopping' ? 'Shopping list' : parts[1] === 'todos' ? 'All to-dos' : parts[1] ? null : 'Tasks';
   return null;
 }
@@ -486,7 +251,6 @@ function route() {
   if (parts[0] === 'new') { nav = 'new'; STREAM_NAME[parts[1]] ? showEditor(null, parts[1]) : showNewPicker(); }
   else if (parts[0] === 's' && (STREAM_NAME[parts[1]] || parts[1] === 'all')) { boardStream = parts[1]; remember(); showBoard(); }
   else if (parts[0] === 'settings') { nav = 'settings'; showSettings(); }
-  else if (parts[0] === 'products') { nav = 'settings'; showProducts(); }
   else if (parts[0] === 'calendar') { nav = 'calendar'; showCalendar(parts[1]); }
   else if (parts[0] === 'frozen') showFrozen();
   else if (parts[0] === 'receipt') { nav = 'receipts'; showReceipt(Number(parts[1]) || null); }
@@ -496,13 +260,11 @@ function route() {
     const listed = store.projects.find(p => p.id === Number(parts[1]));
     if (parts[1] === 'shopping') { nav = 'shopping'; showShopping(); } else if (parts[1] === 'todos') showAllTodos(); else if (listed) showTodo(listed); else showTasks();
   }
-  else if (project && parts[2] === 'quote' && isClient(project)) showQuote(project);
   else if (project && parts[2] === 'design') showDesign(project);
   else if (project && parts[2] === 'cuts') showCuts(project);
   else if (project && parts[2] === 'todo') showTodo(project);
-  else if (project && parts[2] === 'dates') { phaseDatesOpen = true; isBatch(project) ? showBatch(project) : showEditor(project); setTimeout(openPhaseDates, 80); }
+  else if (project && parts[2] === 'dates') { phaseDatesOpen = true; showEditor(project); setTimeout(openPhaseDates, 80); }
   else if (project && parts[2] === 'summary') showSummary(project);
-  else if (project && isBatch(project)) showBatch(project);
   else if (project) showEditor(project);
   else showBoard();
   document.querySelectorAll<HTMLElement>('[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav.split(' ').includes(nav)));
@@ -517,19 +279,19 @@ function route() {
   }, ms));
 }
 window.addEventListener('hashchange', () => {
-  if (ed && !ed.project && ed.dirty && !confirm('Discard this unsaved quote?')) {
+  if (ed && !ed.project && ed.dirty && !confirm('Discard this unsaved project?')) {
     history.replaceState(null, '', currentHash);
     return;
   }
   route();
 });
 // ---------- quick find ----------
-// The magnifier in the header (or "/" on a computer) finds any project by its name, client or quote
-// number, frozen and finished ones too.
+// The magnifier in the header (or "/" on a computer) finds any project by its name, room or wood,
+// frozen and finished ones too.
 const finder = $('#finder'), findInput = $('#findInput') as HTMLInputElement, findResults = $('#findResults');
 function findMatches(q) {
   const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-  const text = p => [projectName(p), p.data.client_name, p.quote_number, STREAM_NAME[streamOf(p)], p.data.spec?.species].join(' ').toLowerCase();
+  const text = p => [projectName(p), p.data.area, STREAM_NAME[streamOf(p)], p.data.species].join(' ').toLowerCase();
   const rank = p => isFrozen(p) ? 1 : archived(p) ? 2 : 0;
   return store.projects.filter(p => words.every(w => text(p).includes(w)))
     .sort((a, b) => rank(a) - rank(b) || b.updated_at.localeCompare(a.updated_at)).slice(0, 12);
@@ -537,7 +299,7 @@ function findMatches(q) {
 function drawFind() {
   const q = findInput.value.trim(), list = q ? findMatches(q) : prioritized().slice(0, 6);
   findResults.innerHTML = (q ? '' : '<li class="findhead muted">Active projects</li>') + (list.map((p, i) => `<li><a href="#/p/${p.id}" class="${i === 0 && q ? 'first' : ''}">
-      <b>${esc(projectName(p))}</b><span class="muted">${isClient(p) ? esc([p.data.client_name, p.quote_number].filter(Boolean).join(' \u00b7 ')) : STREAM_NAME[streamOf(p)]}${isFrozen(p) ? ' \u00b7 frozen' : ''}</span>
+      <b>${esc(projectName(p))}</b><span class="muted">${esc(whereOf(p))}${isFrozen(p) ? ' \u00b7 frozen' : ''}</span>
       <span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></a></li>`).join('') || '<li class="findnone muted">No project matches that.</li>');
 }
 function openFind(open = true) {
@@ -573,14 +335,15 @@ document.addEventListener('focusout', () => setTimeout(() => {
 }, 50));
 
 // ---------- projects board ----------
-// The board shows one stream at a time, or all of them; the choice is remembered on this device.
+// The board shows one stream at a time, or both; the choice is remembered on this device.
 let boardStream = (() => { try { return localStorage.getItem('boardStream') || 'all'; } catch { return 'all'; } })();
 if (!STREAM_NAME[boardStream]) boardStream = 'all';
 function remember() { try { localStorage.setItem('boardStream', boardStream); } catch {} }
 const boardLink = () => boardStream === 'all' ? '#/' : `#/s/${boardStream}`;
 const newLink = () => STREAM_NAME[boardStream] ? `#/new/${boardStream}` : '#/new';
-// What a card shows as the piece's value: a client's quote, a product's price, a gallery piece's cost.
-const valueOf = p => streamOf(p) === 'gallery' ? p.calc.cost ?? p.calc.total : p.calc.total;
+// What a card shows: what's been spent, and the budget if there is one.
+const spentLine = p => { const t = totals(p); return t.budget ? `${money(t.spent)} of ${money(t.budget)}` : money(t.spent); };
+const overBudget = p => { const t = totals(p); return t.budget > 0 && t.spent > t.budget; };
 
 function showBoard() {
   const tab = STREAM_NAME[boardStream] ? boardStream : 'all';
@@ -588,77 +351,53 @@ function showBoard() {
   const frozenCount = store.projects.filter(isFrozen).length;
   const by = (...statuses) => shown.filter(p => statuses.includes(p.status)).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const sum = (list, f) => list.reduce((total, p) => total + f(p), 0);
-  const shopHours = p => p.calc.labor_hours + p.calc.contingency_hours;
-  // On phones the tabs are one row of pills with the short names; if they still don't fit, the row swipes sideways.
+  // On phones the tabs are one row of pills with the short names.
   const tabs = `<nav class="tabs streams">${[['all', 'All projects'], ...STREAMS].map(([key, name]) =>
     `<a href="${key === 'all' ? '#/s/all' : `#/s/${key}`}" class="${key === tab ? 'on' : ''}"${key === tab ? ' aria-current="page"' : ''}><span class="tlong">${name}</span><span class="tshort">${STREAM_SHORT[key]}</span>
       <small>${store.projects.filter(p => key === 'all' || streamOf(p) === key).filter(p => !archived(p) && !isFrozen(p)).length}</small></a>`).join('')}
     <span class="spacer"></span><a href="#/frozen" class="frozenlink">Frozen <small>${frozenCount}</small></a></nav>`;
-  // Keep the chosen pill in view when the phone row has to scroll.
   const tabInView = () => {
     const nav = $('.tabs.streams'), on = nav?.querySelector('a.on');
     if (nav && on && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = on.offsetLeft - (nav.clientWidth - on.offsetWidth) / 2;
   };
-  const newLabel = tab === 'client' ? 'New quote' : 'New project';
-  const head = `<div class="pagehead"><h1>Projects</h1><span class="spacer"></span>${tab === 'product' ? '<a class="btn" href="#/products">Shop products</a>' : ''}<a class="btn wideonly" href="#/receipt">Scan a receipt</a><a class="btn primary wideonly" href="${newLink()}">${newLabel}</a></div>${tabs}`;
-  const quick = tab === 'product' ? '<div class="card" id="quickBatch"></div>' : '';
+  const head = `<div class="pagehead"><h1>Projects</h1><span class="spacer"></span><a class="btn wideonly" href="#/receipt">Scan a receipt</a><a class="btn primary wideonly" href="${newLink()}">New project</a></div>${tabs}`;
   if (!shown.length) {
-    view.innerHTML = `${head}${quick}<div class="card empty"><h1>Nothing here yet</h1>
-      <p class="muted">${tab === 'all' ? 'Start by pricing a piece for a client, or plan one of your own.' : esc(STREAMS.find(x => x[0] === tab)[2])}</p>
-      <p><a class="btn primary" href="${newLink()}">${newLabel}</a></p></div>`;
-    if (quick) renderQuickBatch();
+    view.innerHTML = `${head}<div class="card empty"><h1>Nothing here yet</h1>
+      <p class="muted">${tab === 'all' ? 'Start with a project on the house, or something to build in the shop.' : esc(STREAMS.find(x => x[0] === tab)[2])}</p>
+      <p><a class="btn primary" href="${newLink()}">New project</a></p></div>`;
     return;
   }
-  const active = by('accepted', 'in_progress');
+  const planned = by('planned'), active = by('in_progress'), done = by('complete');
   const statLists = [];
   const stat = (label, value, note, list = []) => {
     statLists.push({ label, list });
     return `<button type="button" class="card stat" data-stat="${statLists.length - 1}" aria-expanded="false" ${list.length ? '' : 'disabled'}><span class="muted">${label}</span><b>${value}</b><span class="muted">${note}</span></button>`;
   };
-  let stats;
-  if (tab === 'client' || tab === 'all') {
-    const open = by('sent'), done = by('complete', 'delivered');
-    // Booked work: client quotes that were accepted (and not yet finished), plus everything sitting in a
-    // phase of the product line, at retail value. Gallery pieces aren't for sale, so they're left out.
-    const booked = active.filter(isClient), products = shown.filter(p => isProduct(p) && !archived(p));
-    const bookedNote = tab === 'all' ? `${booked.length} client \u00b7 ${products.length} product` : `${booked.length} active`;
-    stats = stat('Quotes awaiting answer', money(sum(open, p => p.calc.total)), `${open.length} sent`, open)
-      + stat(tab === 'all' ? 'Booked Work' : 'Booked client work', money(sum([...booked, ...products], valueOf)), bookedNote, [...booked, ...products])
-      + stat('Shop hours booked', hrs(sum(active, shopHours)), tab === 'all' ? 'all active work' : 'accepted + in progress', active)
-      + (tab === 'all' ? stat('Completed', String(done.length), 'pieces finished', done)
-        : stat('Completed', money(sum(done, p => p.calc.total)), `${done.length} finished`, done));
-  } else {
-    const planned = by('planned'), done = by('complete');
-    const valueLabel = tab === 'product' ? 'retail value' : 'cost';
-    stats = stat('Planned', String(planned.length), `${money(sum(planned, valueOf))} ${valueLabel}`, planned)
-      + stat('In progress', String(active.length), `${money(sum(active, valueOf))} ${valueLabel}`, active)
-      + stat('Shop hours booked', hrs(sum(active, shopHours)), 'in progress', active)
-      + stat('Completed', String(done.length), `${money(sum(done, valueOf))} ${valueLabel}`, done);
-  }
+  const open = [...planned, ...active];
+  const budgeted = sum(open, p => totals(p).budget), spentOpen = sum(open, p => totals(p).spent);
+  const year = String(new Date().getFullYear());
+  const spentThisYear = sum(shown, p => (p.data.purchases || []).filter(x => (x.date || '').startsWith(year)).reduce((n, x) => n + num(x.amount), 0));
+  const stats = stat('Planned', String(planned.length), planned.length ? `${money(sum(planned, p => totals(p).budget))} budgeted` : 'none yet', planned)
+    + stat('In progress', String(active.length), active.length ? `${money(sum(active, p => totals(p).spent))} spent so far` : 'nothing under way', active)
+    + stat('Spent on open projects', money(spentOpen), budgeted ? `of ${money(budgeted)} budgeted` : 'no budgets set', open)
+    + stat(`Spent in ${year}`, money(spentThisYear), `${done.length} project${done.length === 1 ? '' : 's'} finished`, done);
   const jobCard = p => `<a class="job" href="#/p/${p.id}" draggable="true" data-id="${p.id}">
       <b>${esc(projectName(p))}</b>
-      <div class="row"><span>${isClient(p) ? esc(p.data.client_name || 'No client yet') : streamOf(p) === 'gallery' ? 'Cost' : 'Retail price'}</span><span class="amt">${money(valueOf(p))}</span></div>
-      <div class="row"><span>${isClient(p) ? esc(p.quote_number) : ''}</span><span>${hrs(shopHours(p))}</span></div>
-      <div class="row foot"><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span>${isBatch(p) && p.data.due_date ? `<span>Ship by ${esc(fmtDate(p.data.due_date))}</span>` : stageDue(p, stageOf(p)) ? `<span>Phase due ${esc(fmtDate(stageDue(p, stageOf(p))))}</span>` : ''}</div>
+      <div class="row"><span>${esc(whereOf(p))}</span></div>
+      <div class="row"><span>Spent</span><span class="amt ${overBudget(p) ? 'over' : ''}">${spentLine(p)}</span></div>
+      <div class="row foot"><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span>${stageDue(p, stageOf(p)) ? `<span>Phase due ${esc(fmtDate(stageDue(p, stageOf(p))))}</span>` : ''}</div>
     </a>`;
   const archive = shown.filter(archived).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const inStage = (key, list = shown) => list.filter(p => !archived(p) && stageOf(p) === key).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  // The product line's Shipped column is where a run goes once it's in the mail: dropping it there
-  // closes it out to the archive, so the column itself stays empty.
-  const boardStages = stream => stream === 'product' ? PRODUCT_STAGES : STAGES;
-  const boardHtml = (list = shown, stream = tab) => `<div class="board ${stream === 'product' ? 'b-product' : ''}">
-      ${boardStages(stream).map(([key, name]) => key === 'shipped'
-        ? `<section class="col shipcol" data-stage="${key}"><h2><span>${name}</span><span></span></h2><p class="muted">Drop a run here once it ships. It closes out and moves to the archive.</p></section>`
-        : `<section class="col" data-stage="${key}">
+  const boardHtml = (list = shown) => `<div class="board b-four">
+      ${STAGES.map(([key, name]) => `<section class="col" data-stage="${key}">
         <h2><span>${name}</span><span>${inStage(key, list).length}</span></h2>${inStage(key, list).map(jobCard).join('')}</section>`).join('')}
     </div>`;
-  // On a phone the board's five wide columns show little, so it becomes a compact list instead: a strip
-  // of phase counts, then one row per project, grouped by phase, with empty phases left out. Each row
-  // shows the name, who it's for, its status, value and the next date it's due. CSS picks which of the
-  // two layouts shows, so turning the phone or resizing a window needs no redraw.
+  // On a phone the board's columns show little, so it becomes a compact list instead: a strip of phase
+  // counts, then one row per project, grouped by phase, with empty phases left out. CSS picks which of
+  // the two layouts shows, so turning the phone or resizing a window needs no redraw.
   const today = ymd(new Date());
-  const nextDue = p => isBatch(p) && p.data.due_date ? ['Ship by', p.data.due_date]
-    : stageDue(p, stageOf(p)) ? [`${STAGE_NAME[stageOf(p)]} due`, stageDue(p, stageOf(p))]
+  const nextDue = p => stageDue(p, stageOf(p)) ? [`${STAGE_NAME[stageOf(p)]} due`, stageDue(p, stageOf(p))]
     : p.data.due_date ? ['Target', p.data.due_date] : null;
   const dueLine = p => {
     const due = nextDue(p);
@@ -667,16 +406,14 @@ function showBoard() {
     const left = n < 0 ? `${-n}d late` : n === 0 ? 'today' : `${n}d`;
     return `<span class="${n < 0 ? 'late' : n <= 7 ? 'soon' : ''}">${due[0]} ${esc(shortDay(due[1]))} &middot; ${left}</span>`;
   };
-  const who = p => isClient(p) ? esc([p.data.client_name || 'No client yet', p.quote_number].filter(Boolean).join(' \u00b7 '))
-    : isBatch(p) ? 'Small batch' : esc([TYPES[p.data.spec?.type]?.name, p.data.spec?.species].filter(Boolean).join(' \u00b7 ') || STREAM_NAME[streamOf(p)]);
   const byDue = (a, b) => (nextDue(a)?.[1] || '9999').localeCompare(nextDue(b)?.[1] || '9999') || b.updated_at.localeCompare(a.updated_at);
   const listRow = p => `<a class="prow" href="#/p/${p.id}">
-      <span class="pmain"><b>${esc(projectName(p))}</b><span class="muted">${who(p)}</span></span>
-      <span class="pside"><span class="amt">${money(valueOf(p))}</span><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></span>
-      <span class="pdue">${dueLine(p)}<span class="muted">${hrs(shopHours(p))}</span></span>
+      <span class="pmain"><b>${esc(projectName(p))}</b><span class="muted">${esc(whereOf(p))}</span></span>
+      <span class="pside"><span class="amt ${overBudget(p) ? 'over' : ''}">${money(totals(p).spent)}</span><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></span>
+      <span class="pdue">${dueLine(p)}<span class="muted">${totals(p).budget ? `budget ${money(totals(p).budget)}` : ''}</span></span>
     </a>`;
-  const listHtml = (list = shown, stream = tab) => {
-    const counts = boardStages(stream).filter(([key]) => key !== 'shipped').map(([key, name]) => [key, name, inStage(key, list).length]);
+  const listHtml = (list = shown) => {
+    const counts = STAGES.map(([key, name]) => [key, name, inStage(key, list).length]);
     const open = counts.reduce((n, c) => n + c[2], 0);
     return `<div class="plist s-${tab}">
       <div class="pstrip">${counts.map(([key, name, n]) => `<span class="${n ? '' : 'zero'}"><i class="st-${key}"></i>${name} <b>${n}</b></span>`).join('')}</div>
@@ -686,24 +423,23 @@ function showBoard() {
     </div>`;
   };
   // "All projects" shows each stream as its own section, one above the other. Every section keeps its
-  // columns, even when empty, so a card can be dragged into another stream.
+  // columns, even when empty, so a card can be dragged into the other stream.
   const lanes = () => STREAMS.map(([key, name]) => {
     const list = shown.filter(p => streamOf(p) === key), open = list.filter(p => !archived(p));
     return `<section class="lane ${key}" data-stream="${key}">
-      <div class="lanehead"><h2>${name} <span>${open.length}</span></h2>${key === 'product' ? '<a href="#/products" class="lprod">Products</a>' : ''}<a href="#/s/${key}">Open<span class="lopen"> ${name.toLowerCase()}</span> &rarr;</a></div>
-      ${boardHtml(list, key)}${listHtml(list, key)}
+      <div class="lanehead"><h2>${name} <span>${open.length}</span></h2><a href="#/s/${key}">Open<span class="lopen"> ${name.toLowerCase()}</span> &rarr;</a></div>
+      ${boardHtml(list)}${listHtml(list)}
     </section>`;
   }).join('');
   view.innerHTML = `
     ${head}
-    ${quick}
     <div class="stats">${stats}</div><div id="statList" hidden></div>
     <div class="boards">${tab === 'all' ? lanes() : boardHtml() + listHtml()}</div>
-    ${archive.length ? `<div class="card" style="margin-top:20px"><h2>Archive</h2><table class="list">
-      <tr><th>Project</th><th>${tab === 'client' ? 'Client' : tab === 'all' ? 'Stream' : ''}</th><th>${tab === 'client' ? 'Quote' : ''}</th><th>${tab === 'gallery' ? 'Cost' : 'Total'}</th><th>Status</th></tr>
+    ${archive.length ? `<div class="card" style="margin-top:20px"><h2>Finished</h2><table class="list">
+      <tr><th>Project</th><th>${tab === 'all' ? 'Stream' : ''}</th><th>Spent</th><th>Budget</th><th>Finished</th></tr>
       ${archive.map(p => `<tr><td><a href="#/p/${p.id}">${esc(projectName(p))}</a></td>
-        <td>${tab === 'client' ? esc(p.data.client_name) : tab === 'all' ? STREAM_NAME[streamOf(p)] : ''}</td>
-        <td>${tab === 'client' ? esc(p.quote_number) : ''}</td><td>${money(valueOf(p))}</td><td><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></td></tr>`).join('')}
+        <td>${tab === 'all' ? STREAM_NAME[streamOf(p)] : ''}</td><td>${money(totals(p).spent)}</td><td>${totals(p).budget ? money(totals(p).budget) : ''}</td>
+        <td>${esc(fmtDate(finishedAt(p)))}</td></tr>`).join('')}
       </table></div>` : ''}`;
 
   tabInView();
@@ -718,10 +454,9 @@ function showBoard() {
     b.setAttribute('aria-expanded', 'true');
     const { label, list } = statLists[Number(b.dataset.stat)];
     box.innerHTML = `<div class="card statlist"><h2>${label} <span class="muted">${list.length}</span></h2><ul>${list.map(p => `<li><a href="#/p/${p.id}">${esc(projectName(p))}</a>
-      <span class="muted">${isClient(p) ? esc(p.data.client_name || p.quote_number) : STREAM_NAME[streamOf(p)]}</span><span class="amt">${money(valueOf(p))}</span><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></li>`).join('')}</ul></div>`;
+      <span class="muted">${STREAM_NAME[streamOf(p)]}</span><span class="amt">${spentLine(p)}</span><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></li>`).join('')}</ul></div>`;
   });
-  if (quick) renderQuickBatch();
-  // Drag a card to another column to change its phase, or (on "All projects") into another stream's section.
+  // Drag a card to another column to change its phase, or (on "All projects") into the other stream's section.
   const board = $('.boards');
   let dragged = null;
   const clearOver = () => board.querySelectorAll('.col.over').forEach(c => c.classList.remove('over'));
@@ -757,7 +492,7 @@ function showBoard() {
   });
 }
 
-// ---------- calendar of accepted projects ----------
+// ---------- calendar of projects under way ----------
 const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 function showCalendar(month) {
@@ -765,15 +500,15 @@ function showCalendar(month) {
   const [year, mon] = (/^\d{4}-\d{2}$/.test(month || '') ? month : today.slice(0, 7)).split('-').map(Number);
   const monthLink = offset => `#/calendar/${ymd(new Date(year, mon - 1 + offset, 1)).slice(0, 7)}`;
 
-  // A job goes on the calendar once its quote is accepted (or, for the shop's own pieces, once work
-  // starts) and comes off when it is delivered.
+  // A project goes on the calendar once work starts (or, while still planned, once it has a date), and
+  // comes off when it is complete.
   // Its bar is split at each phase's due date, one colored stretch per phase; phases already
   // finished are faded. With no phase dates it is one bar in the color of the current phase.
   const nextDay = date => { const d = new Date(date + 'T00:00'); d.setDate(d.getDate() + 1); return ymd(d); };
-  // A product run comes off as soon as it ships.
-  const jobs = store.projects.filter(p => !isFrozen(p) && ['accepted', 'in_progress', 'complete'].includes(p.status) && !(isProduct(p) && p.status === 'complete')).map(p => {
-    const began = (isClient(p) && p.history.findLast(h => h.status === 'accepted')) || p.history.findLast(h => h.status === 'in_progress');
-    const start = ymd(new Date(began?.at || p.updated_at));
+  const dated = p => !!(p.data.due_date || Object.values(p.data.stage_due || {}).some(Boolean));
+  const jobs = store.projects.filter(p => !isFrozen(p) && (p.status === 'in_progress' || (p.status === 'planned' && dated(p)))).map(p => {
+    const began = p.history.findLast(h => h.status === 'in_progress');
+    const start = ymd(new Date(began?.at || p.created_at));
     const current = stageIndex(p);
     const dated = stagesFor(p).map(([key], i) => ({ key, i, due: stageDue(p, key) })).filter(x => x.due);
     let segs = [];
@@ -820,7 +555,7 @@ function showCalendar(month) {
         const text = key === seg.from && key !== j.start ? `\u25b8 ${STAGE_NAME[seg.key]} starts \u00b7 ${projectName(j.p)}` : named ? `${projectName(j.p)} \u00b7 ${STAGE_NAME[seg.key]}${due ? ' (due)' : ''}` : due ? 'Due' : '';
         const turn = key === seg.from && key !== j.start;
         return `<a class="bar st-${seg.key} ${seg.past ? 'past' : ''} ${named ? 'label' : ''} ${turn ? 'turn' : ''} ${key === j.start ? 's' : ''} ${key === j.end ? 'e' : ''}" href="#/p/${j.p.id}"
-          title="${esc(projectName(j.p))} \u2013 ${esc(isClient(j.p) ? j.p.data.client_name || STREAM_NAME.client : STREAM_NAME[streamOf(j.p)])}">${esc(text)}</a>`;
+          title="${esc(projectName(j.p))} \u2013 ${esc(STREAM_NAME[streamOf(j.p)])}">${esc(text)}</a>`;
       }).join('')}</div>`;
     }
     day.setDate(day.getDate() + 7);
@@ -840,10 +575,10 @@ function showCalendar(month) {
     <div class="cal">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(n => `<div class="dow">${n}</div>`).join('')}${cells}</div>
     <div class="legend">${calLegend(jobs)}</div>
     <div class="card" style="margin-top:16px"><h2>Scheduled projects</h2>
-      ${jobs.length ? `<table class="list"><tr><th>Project</th><th>Client or stream</th><th>Should be in</th><th>Marked</th><th>Phase due</th><th>Target completion</th></tr>
+      ${jobs.length ? `<table class="list"><tr><th>Project</th><th>Stream</th><th>Should be in</th><th>Marked</th><th>Phase due</th><th>Target completion</th></tr>
         ${jobs.map(j => `<tr><td><span class="swatch st-${plan(j).expected || stageOf(j.p)}"></span><a href="#/p/${j.p.id}">${esc(projectName(j.p))}</a></td>
-          <td>${isClient(j.p) ? esc(j.p.data.client_name) : STREAM_NAME[streamOf(j.p)]}</td><td>${shouldBe(plan(j))}</td><td>${STAGE_NAME[stageOf(j.p)]}</td><td>${dueText(j, stageDue(j.p, stageOf(j.p)))}</td><td>${dueText(j, j.p.data.due_date)}</td></tr>`).join('')}</table>`
-        : '<p class="muted" style="margin:0">Nothing is scheduled. A project appears here once its quote is marked accepted (or work starts on a product or gallery piece), from that day to its target completion date.</p>'}
+          <td>${STREAM_NAME[streamOf(j.p)]}</td><td>${shouldBe(plan(j))}</td><td>${STAGE_NAME[stageOf(j.p)]}</td><td>${dueText(j, stageDue(j.p, stageOf(j.p)))}</td><td>${dueText(j, j.p.data.due_date)}</td></tr>`).join('')}</table>`
+        : '<p class="muted" style="margin:0">Nothing is scheduled. A project appears here once work starts on it, or once a planned project has a due date, up to its target date.</p>'}
     </div>`;
 }
 
@@ -864,9 +599,8 @@ const calHeadButtons = monthLink => `
       ${monthLink ? `<a class="btn" href="${monthLink(-1)}" aria-label="Previous month">&larr;</a>` : ''}
       <a class="btn" href="#/calendar" data-caltoday>Today</a>
       ${monthLink ? `<a class="btn" href="${monthLink(1)}" aria-label="Next month">&rarr;</a>` : ''}`;
-// The calendar's color key: the client phases, plus the product line's when a product run is on it.
-const calLegend = jobs => [...STAGES.map(([key, name]) => key === 'build' && jobs.some(j => isProduct(j.p)) ? [key, 'Build / Building'] : [key, name]), ...(jobs.some(j => isProduct(j.p)) ? PRODUCT_STAGES.filter(([key]) => key === 'packaging') : [])]
-  .map(([key, name]) => `<span><span class="swatch st-${key}"></span>${name}</span>`).join('');
+// The calendar's color key: one color per phase.
+const calLegend = _jobs => STAGES.map(([key, name]) => `<span><span class="swatch st-${key}"></span>${name}</span>`).join('');
 // "Build", or "Build — still marked Design" in red when the board is behind the dates.
 const shouldBe = pl => !pl.expected ? '<span class="muted">Not started yet</span>'
   : `<span class="stagechip st-${pl.expected}">${STAGE_NAME[pl.expected]}</span>${pl.late ? ' <span class="late">past target date</span>' : pl.behind ? ` <span class="late">still marked ${STAGE_NAME[pl.marked]}</span>` : ''}`;
@@ -943,13 +677,13 @@ function showTimeline({ year, mon, today, jobs: all, plan, shortDate, monthLink 
       <div class="tl-scroll"><div class="tl-canvas">
       <div class="tl-head">${todayTag}<div class="tl-weeks">${weekLabels}</div>
       <div class="tl-days">${dayNums}</div></div>
-      ${shown.length ? shown.map(row).join('') : '<p class="muted" style="margin:12px 0 0">Nothing is scheduled this month. A project appears once its quote is accepted (or work starts on a product or gallery piece), from that day to its target completion date.</p>'}
+      ${shown.length ? shown.map(row).join('') : '<p class="muted" style="margin:12px 0 0">Nothing is scheduled this month. A project appears once work starts on it, or once a planned project has a due date, up to its target date.</p>'}
       </div></div>
     </div>
     <div class="legend">${calLegend(jobs)}<span><span class="swatch tl-todaykey"></span>Today</span></div>
     ${undated.length ? `<div class="card needdates"><h2>Needs dates <span class="muted">${undated.length}</span></h2>
-      <p class="muted">Under way, but with no phase or delivery dates yet, so they can't go on the timeline.</p>
-      <ul>${undated.map(j => `<li><span><b>${esc(projectName(j.p))}</b> <span class="muted">${isClient(j.p) ? esc(j.p.data.client_name || j.p.quote_number) : STREAM_NAME[streamOf(j.p)]} &middot; ${STAGE_NAME[stageOf(j.p)]}</span></span>
+      <p class="muted">Under way, but with no phase or install dates yet, so they can't go on the timeline.</p>
+      <ul>${undated.map(j => `<li><span><b>${esc(projectName(j.p))}</b> <span class="muted">${STREAM_NAME[streamOf(j.p)]} &middot; ${STAGE_NAME[stageOf(j.p)]}</span></span>
         <a class="btn small" href="#/p/${j.p.id}/dates">Set dates</a></li>`).join('')}</ul></div>` : ''}`;
   view.querySelector('.tl-canvas').style.setProperty('--days', days);
   if (swipe) swipeTimeline({ days, first, dateAt, col, todayCol, monthTitle });
@@ -1132,25 +866,18 @@ function showNewPicker() {
     <div class="picker">${STREAMS.map(([key, name, about]) => `<a class="card pick" href="#/new/${key}"><b>${name}</b><span class="muted">${about}</span></a>`).join('')}</div>`;
 }
 
-// ---------- quote editor / project page ----------
-function blankData() {
-  const s = store.settings, [length, width, height] = TYPES.dining_table.ref;
-  return {
-    title: '', client_name: '', client_email: '', client_phone: '', client_state: '', due_date: '', notes: '',
-    spec: { type: 'dining_table', description: '', species: (s.species.find(x => x.name === 'Walnut') || s.species[0] || {}).name || '',
-      length, width, height, complexity: 'standard', finish: 'hardwax', drawers: 0, doors: 0, shelves: 0, delivery_hours: 0 },
-    rates: { hourly_rate: s.hourly_rate, contingency_pct: s.contingency_pct, markup_pct: s.markup_pct, tax_pct: s.tax_pct, deposit_pct: s.deposit_pct },
-    phases: [], materials_override: '', other_costs: 0, retainer: s.design_retainer, final_price: '',
-  };
+// ---------- project page ----------
+function blankData(stream) {
+  return { title: '', description: '', area: '', species: stream === 'shop' ? 'Walnut' : '', budget: '', notes: '', due_date: '', lumber: { bf: '', quarters: '', width: '' } };
 }
 
-// Heading and tabs shared by a project's Details and Client quote views.
+// Heading and tabs shared by a project's pages.
 function projectHeader(p, tab, side) {
   return `<div class="noprint projheadwrap">
     ${backLink(boardLink(), 'Projects')}
     <div class="projhead">
       <div class="name"><h1 id="projTitle">${esc(projectName(p))}</h1><span class="pill ${p.status}" id="statusPill">${STATUS_NAME[p.status]}</span></div>
-      <div class="sub">${isClient(p) ? `${esc(p.quote_number)} &middot; ` : ''}${STREAM_NAME[streamOf(p)]}</div>
+      <div class="sub">${STREAM_NAME[streamOf(p)]}${p.data.area ? ` &middot; ${esc(p.data.area)}` : ''}</div>
     </div>
     ${isFrozen(p) ? `<div class="note frozen"><span><b>Frozen since ${esc(fmtDate(p.data.frozen.at))}</b>${p.data.frozen.reason ? `: ${esc(p.data.frozen.reason)}` : ''}.
       It's off the board and calendar until you unfreeze it.</span><button type="button" class="btn small" data-unfreeze="${p.id}">Unfreeze</button></div>` : ''}
@@ -1159,8 +886,7 @@ function projectHeader(p, tab, side) {
       <a href="#/p/${p.id}/todo" class="${tab === 'todo' ? 'on' : ''}">To-do list${todoLeft(p) ? ` <small>${todoLeft(p)}</small>` : ''}</a>
       <a href="#/p/${p.id}/cuts" class="${tab === 'cuts' ? 'on' : ''}">Cut list${cutsLeft(p) ? ` <small title="pieces left to cut">${cutsLeft(p)}</small>` : ''}</a>
       <a href="#/p/${p.id}/design" class="${tab === 'design' ? 'on' : ''}">Design notes</a>
-      ${isClient(p) ? `<a href="#/p/${p.id}/quote" class="${tab === 'quote' ? 'on' : ''}">Client quote</a>` : ''}
-      <a href="#/p/${p.id}/summary" class="${tab === 'summary' ? 'on' : ''}">Summary</a>
+      <a href="#/p/${p.id}/summary" class="${tab === 'summary' ? 'on' : ''}">Costs</a>
       <span class="spacer"></span><span class="side">${side}</span>
     </nav>
     ${/<button/.test(side) ? `<div class="sidem">${side}</div>` : ''}
@@ -1170,11 +896,10 @@ const todoLeft = p => (p.data.todo?.items || []).filter(t => !t.done_at).length;
 const cutsLeft = p => (p.data.cutlist?.items || []).filter(t => !t.done_at).reduce((n, t) => n + (t.qty || 1), 0);
 
 // ---------- the Now strip ----------
-// At the top of a project that's under way: the next status step, the next date it's due, its next few
-// to-dos (tick them right there) and quick ways to scan a receipt or add to its shopping list.
-// Drafts and quotes waiting on an answer don't get one: the quote itself is what's being worked on then.
-const showsNow = p => !archived(p) && !(isClient(p) && ['draft', 'sent'].includes(p.status));
-const nextStepOf = p => p.status === 'in_progress' && isProduct(p) ? ['complete', 'Mark shipped'] : (isClient(p) ? NEXT_STEP : OWN_NEXT_STEP)[p.status];
+// At the top of a project that's under way (or planned): the next status step, the next date it's due,
+// its next few to-dos (tick them right there) and quick ways to scan a receipt or add to its shopping list.
+const showsNow = p => !archived(p);
+const nextStepOf = p => NEXT_STEP[p.status];
 // The next date coming up: the current phase's due date, else the next phase that has one.
 function nextDue(p) {
   const stages = stagesFor(p), i = Math.max(0, stageIndex(p));
@@ -1192,7 +917,7 @@ function renderNow(p) {
   el.hidden = false;
   const today = ymd(new Date()), next = nextStepOf(p), due = nextDue(p);
   const left = due ? Math.round((+new Date(due.due + 'T00:00') - +new Date(today + 'T00:00')) / 86400000) : 0;
-  const dueLabel = due ? (due.last ? (isProduct(p) ? 'Ship by' : 'Delivery due') : `${STAGE_NAME[due.key]} due`) : '';
+  const dueLabel = due ? (due.last ? 'Install due' : `${STAGE_NAME[due.key]} due`) : '';
   const open = (p.data.todo?.items || []).filter(t => !t.done_at), firstFew = open.slice(0, 3);
   el.innerHTML = `<div class="card now">
     <div class="nowtop">
@@ -1239,69 +964,49 @@ function openPhaseDates() {
   setTimeout(() => el.classList.remove('flash'), 1600);
 }
 
-function showEditor(project, newStream = 'client') {
-  const stream = project ? streamOf(project) : newStream, client = stream === 'client';
-  ed = { project, stream, data: project ? project.data : blankData(), dirty: false };
+function showEditor(project, newStream = 'home') {
+  const stream = project ? streamOf(project) : newStream;
+  ed = { project, stream, data: project ? project.data : blankData(stream), dirty: false };
   const d = ed.data;
   d.lumber ??= { bf: '', quarters: '', width: '' };
   const inp = (label, path, type = 'text', cls = '', attrs = '') =>
     `<label class="f ${cls}"><span>${label}</span><input data-path="${path}" type="${type}" value="${esc(getPath(d, path) ?? '')}" ${attrs}></label>`;
-  const numInp = (label, path, step: number | string = 'any', cls = '', attrs = '') => inp(label, path, 'number', cls, `min="0" step="${step}" ${attrs}`);
-  const sel = (label, path, options, cls = '') =>
-    `<label class="f ${cls}"><span>${label}</span><select data-path="${path}">${options.map(([v, n]) =>
-      `<option value="${esc(v)}" ${getPath(d, path) === v ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></label>`;
-  const speciesNames = store.settings.species.map(s => s.name);
-  if (d.spec.species && !speciesNames.includes(d.spec.species)) speciesNames.push(d.spec.species);
-  // Once a job is accepted (or a piece of your own is started) the quote form folds up, so the page leads
-  // with what's needed day to day. It opens with a tap, and stays open for that project until you leave.
-  const foldable = !!project && (client ? !['draft', 'sent'].includes(project.status) : project.status !== 'planned');
-  const folded = foldable && !quoteOpen.has(project.id);
+  const speciesNames = ['', ...store.settings.species.map(s => s.name)];
+  if (d.species && !speciesNames.includes(d.species)) speciesNames.push(d.species);
+  // Once work starts the details fold up, so the page leads with what's needed day to day. They open
+  // with a tap, and stay open for that project until you leave.
+  const foldable = !!project && project.status !== 'planned';
+  const folded = foldable && !detailsOpen.has(project.id);
 
   view.innerHTML = `
     ${project ? projectHeader(project, 'details', '<span class="muted">Changes save automatically</span>')
-      : `<a href="${boardLink()}" class="back">&larr; Projects</a><div class="pagehead"><h1>${client ? 'New quote' : `New ${STREAM_NAME[stream].toLowerCase()} piece`}</h1>
+      : `<a href="${boardLink()}" class="back">&larr; Projects</a><div class="pagehead"><h1>New ${stream === 'shop' ? 'shop build' : 'home project'}</h1>
         <span class="spacer"></span><a href="#/new">Change kind of project</a></div>`}
     ${project ? '<div id="nowStrip" hidden></div><div class="stages" id="stages" role="group" aria-label="Project phase"></div>' : ''}
     <div class="cols ${folded ? 'folded' : ''}" id="cols">
       <form class="card" id="form" autocomplete="off">
         ${foldable ? `<button type="button" class="foldbar" id="foldBar" aria-expanded="${!folded}" aria-controls="form">
-          <span><b>${client ? 'Quote details' : 'Piece details'}</b><span class="muted" id="foldSum"></span></span><span class="foldword">${folded ? 'Show' : 'Hide'}</span></button>` : ''}
-        ${client ? `<fieldset><h2>Client</h2><div class="grid">
-          ${inp('Name', 'client_name')}${inp('Email', 'client_email', 'email')}${inp('Phone', 'client_phone', 'tel')}
-          ${sel('State (sets the sales tax)', 'client_state', [['', 'Not set'], ...STATES], 'w3')}
-        </div></fieldset>` : ''}
-        <fieldset><h2>What's being built</h2><div class="grid">
-          ${inp('Project name', 'title', 'text', 'w6', 'placeholder="e.g. Live-edge dining table"')}
-          ${sel('Furniture type', 'spec.type', Object.entries(TYPES).map(([k, t]) => [k, t.name]), 'w3')}
-          ${sel('Wood species', 'spec.species', speciesNames.map(n => [n, n]), 'w3')}
-          ${numInp('Length (in)', 'spec.length')}${numInp('Width / depth (in)', 'spec.width')}${numInp('Height (in)', 'spec.height')}
-          <label class="f w6"><span>Description${client ? ' (shown on the quote)' : ''}</span><textarea data-path="spec.description">${esc(d.spec.description)}</textarea></label>
+          <span><b>Project details</b><span class="muted" id="foldSum"></span></span><span class="foldword">${folded ? 'Show' : 'Hide'}</span></button>` : ''}
+        <fieldset><h2>What it is</h2><div class="grid">
+          ${inp('Project name', 'title', 'text', 'w6', `placeholder="${stream === 'shop' ? 'e.g. Walnut dresser' : 'e.g. Kitchen backsplash'}"`)}
+          ${stream === 'shop'
+            ? `<label class="f w3"><span>Wood</span><select data-path="species">${speciesNames.map(n => `<option value="${esc(n)}" ${n === (d.species || '') ? 'selected' : ''}>${esc(n || 'Not chosen yet')}</option>`).join('')}</select></label>
+               ${inp('Where it goes', 'area', 'text', 'w3', 'placeholder="e.g. Bedroom"')}`
+            : inp('Room or area', 'area', 'text', 'w3', 'placeholder="e.g. Kitchen"')}
+          <label class="f w6"><span>Description</span><textarea data-path="description" placeholder="What you're doing and why, sizes, the look you're after">${esc(d.description || '')}</textarea></label>
         </div></fieldset>
-        <fieldset><h2>Build details</h2><div class="grid">
-          ${sel('Joinery & complexity', 'spec.complexity', Object.entries(COMPLEXITY).map(([k, c]) => [k, c.name]), 'w3')}
-          ${sel('Finish', 'spec.finish', Object.entries(FINISHES).map(([k, f]) => [k, f.name]), 'w3')}
-          ${numInp('Drawers', 'spec.drawers', 1)}${numInp('Doors', 'spec.doors', 1)}${numInp('Shelves', 'spec.shelves', 1)}
-          ${numInp('Delivery & install (hours)', 'spec.delivery_hours', 0.25, 'w3')}
-        </div></fieldset>
-        <fieldset><h2>${stream === 'gallery' ? 'Cost' : 'Pricing'}</h2><div class="grid">
-          ${numInp('Hourly rate ($)', 'rates.hourly_rate')}${numInp('Contingency (%)', 'rates.contingency_pct')}
-          ${stream === 'gallery' ? '' : numInp('Materials markup (%)', 'rates.markup_pct')}
-          ${client ? `${numInp('Sales tax (%)', 'rates.tax_pct')}${numInp('Deposit (%)', 'rates.deposit_pct')}` : ''}${numInp('Hardware & other costs ($)', 'other_costs')}
-          ${client ? numInp('Design retainer ($)', 'retainer', 'any', 'w3') : ''}
-          ${numInp('Lumber cost override ($)', 'materials_override', 'any', 'w3', 'id="override"')}
-          ${stream === 'gallery' ? '' : `${numInp(client ? 'Agreed final price ($, with tax)' : 'Retail price ($)', 'final_price', 'any', 'w3', 'id="finalPrice"')}
-          <p class="muted" style="grid-column:1/-1;margin:0;font-size:13px">${client
-            ? 'Leave blank to use the estimate. Once you and the client agree on a price, enter it here: it becomes the quote total everywhere, including the client quote, deposit and the totals on the board.'
-            : 'Leave blank to use the suggested retail price.'}</p>`}
-        </div></fieldset>
+        <fieldset><h2>Budget</h2><div class="grid">
+          ${inp('Budget ($)', 'budget', 'number', 'w3', 'min="0" step="any" inputmode="decimal" placeholder="Leave blank if there isn\'t one"')}
+        </div><p class="muted" style="margin:6px 0 0;font-size:13px">Everything bought for the project counts against it: scanned receipts and purchases typed in.</p></fieldset>
         <fieldset><h2>Notes</h2><div class="grid">
-          <label class="f w6"><span>${client ? 'Internal notes (not shown on the quote)' : 'Notes'}</span><textarea data-path="notes">${esc(d.notes)}</textarea></label>
+          <label class="f w6"><span>Notes</span><textarea data-path="notes">${esc(d.notes || '')}</textarea></label>
         </div></fieldset>
+        ${project ? '' : `<button type="button" class="btn primary" id="create" style="width:100%">Save project</button>`}
       </form>
       <aside>
-        <div class="card" id="panel"></div>
+        ${project ? '<div class="card" id="budgetCard"></div>' : ''}
         <div class="card" id="lumberCard">
-          <h2>Lumber pickup</h2>
+          <h2>Lumber to buy</h2>
           <div class="grid">
             <label class="f"><span>Board feet needed</span><input type="number" min="0" step="any" data-lumber="bf" value="${esc(d.lumber.bf)}"></label>
             <label class="f"><span>Board thickness</span><select data-lumber="quarters">
@@ -1324,59 +1029,28 @@ function showEditor(project, newStream = 'client') {
   form.addEventListener('input', e => {
     const el = e.target;
     if (!el.dataset.path) return;
-    if (el.dataset.path === 'client_state') {
-      // Choosing the client's state applies that state's sales tax; the rate can still be adjusted below.
-      d.rates.tax_pct = pos(el.value ? store.settings.state_tax[el.value] : store.settings.tax_pct);
-      $('[data-path="rates.tax_pct"]', form).value = d.rates.tax_pct;
-    }
-    if (el.dataset.path === 'spec.type') {
-      // Swap in the new type's typical size unless the dimensions were customised.
-      const oldRef = TYPES[d.spec.type].ref, newRef = TYPES[el.value].ref;
-      if (['length', 'width', 'height'].every((k, i) => num(d.spec[k]) === oldRef[i])) {
-        ['length', 'width', 'height'].forEach((k, i) => { d.spec[k] = newRef[i]; $(`[data-path="spec.${k}"]`, form).value = newRef[i]; });
-      }
-    }
     setPath(d, el.dataset.path, inputValue(el));
     changed();
   });
-
-  const panel = $('#panel');
-  panel.addEventListener('change', e => {
-    const el = e.target, phase = d.phases[el.dataset.i];
-    if (!phase) return;
-    if (el.dataset.k === 'name') phase.name = el.value;
-    else {
-      phase.hours = pos(el.value);
-      if (!phase.custom) phase.manual = phase.hours !== phase.est_hours;
-    }
-    // Re-render after focus has moved, then put focus back where the user went.
-    setTimeout(() => {
-      const focusId = (document.activeElement as HTMLElement)?.dataset?.fid;
-      changed();
-      if (focusId) $(`[data-fid="${focusId}"]`, panel)?.focus();
-    });
-  });
-  panel.addEventListener('click', e => {
-    const el = e.target.closest('[data-act]');
-    if (!el) return;
-    const i = Number(el.dataset.i);
-    if (el.dataset.act === 'reset') d.phases[i].manual = false;
-    else if (el.dataset.act === 'remove') d.phases.splice(i, 1);
-    else if (el.dataset.act === 'add') d.phases.push({ key: `custom-${Date.now()}`, name: '', hours: 1, custom: true });
-    else if (el.dataset.act === 'create') return createProject();
-    changed();
-    if (el.dataset.act === 'add') $(`[data-fid="n${d.phases.length - 1}"]`, panel)?.focus();
-  });
+  $('#create')?.addEventListener('click', () => createProject());
 
   $('#lumberCard').addEventListener('input', e => {
     if (!e.target.dataset.lumber) return;
     d.lumber[e.target.dataset.lumber] = inputValue(e.target);
     changed();
   });
+  $('#lumberCard').addEventListener('click', e => {
+    if (!(e.target as Element).closest('[data-addlumber]') || !ed.project) return;
+    const p = ed.project, text = lumberSummary(d, lumberNeeds(d, cutBoardFeet(p)));
+    p.data.todo ??= defaultTodo(p);
+    p.data.todo.lumber.push(newTask(text));
+    todoChanged(p, { what: 'added', text, list: 'lumber' });
+    renderShopMini(p);
+    toast('Added to the shopping list.');
+  });
   if (project) {
     $('#delete').addEventListener('click', () => {
-      const what = isClient(project) ? `${project.quote_number} (${projectName(project)})` : projectName(project);
-      if (!confirm(`Delete ${what}? This cannot be undone.`)) return;
+      if (!confirm(`Delete ${projectName(project)}? This cannot be undone.`)) return;
       store.projects = store.projects.filter(p => p !== project);
       persist();
       location.hash = boardLink();
@@ -1385,7 +1059,7 @@ function showEditor(project, newStream = 'client') {
     renderStatusCard();
     $('#foldBar')?.addEventListener('click', () => {
       const open = $('#cols').classList.toggle('folded') === false;
-      if (open) quoteOpen.add(project.id); else quoteOpen.delete(project.id);
+      if (open) detailsOpen.add(project.id); else detailsOpen.delete(project.id);
       $('#foldBar').setAttribute('aria-expanded', String(open));
       $('#foldBar .foldword').textContent = open ? 'Hide' : 'Show';
     });
@@ -1405,7 +1079,6 @@ function showEditor(project, newStream = 'client') {
       if (!t) return;
       if ((e.target as Element).matches('input[type=checkbox]')) e.preventDefault();
       t.done_at = t.done_at ? null : new Date().toISOString();
-      if (t.done_at) delete t.auto;
       todoChanged(project, { what: t.done_at ? 'done' : 'undone', text: t.text, list: 'lumber' });
       renderShopMini(project);
     });
@@ -1413,16 +1086,14 @@ function showEditor(project, newStream = 'client') {
   renderPanel();
   if (project) { renderPurchasesCard(project); renderNow(project); }
 }
-const quoteOpen = new Set();   // projects whose folded quote form was opened
+const detailsOpen = new Set();   // projects whose folded details were opened
 
-// The project's own shopping list, under the lumber calculator: what's left to buy, plus what was bought this week.
+// The project's own shopping list, under the lumber card: what's left to buy, plus what was bought this week.
 function renderShopMini(p) {
   const ul = $('#shopMini');
   if (!ul) return;
   const since = new Date(Date.now() - SHOPPING_KEEP_DAYS * 86400000).toISOString();
-  const lumber = p.data.todo?.lumber || [];
-  for (const t of lumber) if (t.auto && !t.done_at) t.text = lumberLine(p);
-  const shown = lumber.filter(t => !t.done_at || t.done_at >= since);
+  const shown = (p.data.todo?.lumber || []).filter(t => !t.done_at || t.done_at >= since);
   ul.innerHTML = shown.map(t => `<li class="task ${t.done_at ? 'done' : ''}" data-id="${esc(t.id)}">
       <input type="checkbox" ${t.done_at ? 'checked' : ''} aria-label="${esc(t.text)}"><span class="text">${esc(t.text)}</span>
       ${t.done_at ? `<span class="when">Bought ${esc(fmtDate(t.done_at))}</span>` : ''}</li>`).join('')
@@ -1439,54 +1110,33 @@ function changed() {
   }
 }
 
+// The budget card and the lumber card, from the project as it stands.
 function renderPanel() {
-  const d = ed.data, stream = ed.stream, calc = price(d, stream);
-  if (ed.project) ed.project.calc = calc;
-  const override = $('#override');
-  if (override) override.placeholder = `Estimate: ${money(calc.materials_est)}`;
-  const finalPrice = $('#finalPrice');
-  if (finalPrice) finalPrice.placeholder = `Estimate: ${money(calc.estimate_total)}`;
-  const estLine = calc.agreed ? `<div class="tot"><span class="muted">Estimate <small>from pricing and time</small></span><span class="muted">${money(calc.estimate_total)}</span></div>` : '';
-  const overridden = !(d.materials_override === '' || d.materials_override == null);
-  $('#panel').innerHTML = `
-    <h2>Labor estimate</h2>
-    ${d.phases.map((p, i) => `<div class="ph">
-      ${p.custom ? `<input data-i="${i}" data-k="name" data-fid="n${i}" value="${esc(p.name)}" placeholder="Task name" aria-label="Task name">` : `<span>${esc(p.name)}</span>`}
-      <input type="number" min="0" step="0.25" data-i="${i}" data-k="hours" data-fid="h${i}" value="${p.hours}" aria-label="${esc(p.name || 'Task')} hours">
-      <span class="hint">${p.custom ? `<button type="button" class="link" data-act="remove" data-i="${i}">remove</button>`
-        : p.manual ? `est. ${p.est_hours} &middot; <button type="button" class="link" data-act="reset" data-i="${i}">reset</button>` : 'estimated'}</span>
-    </div>`).join('')}
-    <button type="button" class="link" data-act="add">+ Add a task</button>
-    <hr class="rule">
-    <div class="tot"><span>Labor</span><span>${hrs(calc.labor_hours)}</span></div>
-    <div class="tot"><span>Contingency <small>${+pos(d.rates.contingency_pct)}%</small></span><span>+ ${hrs(calc.contingency_hours)}</span></div>
-    <div class="tot"><span>Labor cost <small>${hrs(calc.labor_hours + calc.contingency_hours)} @ ${money(pos(d.rates.hourly_rate))}/h</small></span><b>${money(calc.labor_cost)}</b></div>
-    <div class="tot"><span>Materials <small>${overridden ? 'your lumber cost' : `${calc.lumber.feet ? `${calc.lumber.boards} \u00d7 ${BOARD_LENGTH_FT} ft boards, ` : '~'}${+calc.lumber.buyBf} bf ${esc(d.spec.species)}`}${stream === 'gallery' ? '' : ` + ${+pos(d.rates.markup_pct)}% markup`}</small></span><b>${money(calc.materials_cost)}</b></div>
-    ${calc.other_costs ? `<div class="tot"><span>Hardware & other</span><b>${money(calc.other_costs)}</b></div>` : ''}
-    ${calc.tax && !calc.agreed ? `<div class="tot"><span>Sales tax <small>${d.client_state ? `${esc(d.client_state)} ` : ''}${+pos(d.rates.tax_pct)}%</small></span><b>${money(calc.tax)}</b></div>` : ''}
-    ${stream === 'gallery' ? `<div class="tot grand"><span>Total cost</span><span>${money(calc.cost)}</span></div>`
-      : stream === 'product' ? `${estLine}<div class="tot grand"><span>${calc.agreed ? 'Retail price' : 'Suggested retail price'}</span><span>${money(calc.total)}</span></div>
-        <div class="tot"><span class="muted">Cost to make <small>time, lumber and hardware</small></span><span class="muted">${money(calc.cost)}</span></div>`
-      : `${estLine}<div class="tot grand"><span>${calc.agreed ? 'Agreed price' : 'Quote total'}</span><span>${money(calc.total)}</span></div>
-        ${calc.agreed && calc.tax ? `<div class="tot"><span class="muted">Includes sales tax <small>${+pos(d.rates.tax_pct)}%</small></span><span class="muted">${money(calc.tax)}</span></div>` : ''}`}
-    ${calc.retainer ? `<div class="tot"><span>Design retainer <small>already paid</small></span><span>&minus; ${money(calc.retainer)}</span></div>
-    <div class="tot"><b>Balance due</b><b>${money(calc.balance)}</b></div>` : ''}
-    ${stream === 'client' ? `<div class="tot"><span class="muted">Deposit <small>${+pos(d.rates.deposit_pct)}%${calc.retainer ? ' of balance' : ''}</small></span><span class="muted">${money(calc.deposit)}</span></div>` : ''}
-    ${ed.project ? '' : `<hr class="rule"><button type="button" class="btn primary" data-act="create" style="width:100%">${stream === 'client' ? 'Save quote' : 'Save project'}</button>`}`;
-  renderLumber(calc);
+  const p = ed.project;
+  if (p) {
+    const t = totals(p);
+    p.calc = t;
+    const card = $('#budgetCard');
+    card.innerHTML = `<h2>Budget</h2>
+      <div class="tot"><span>Spent so far <small>${(p.data.purchases || []).length} item${(p.data.purchases || []).length === 1 ? '' : 's'}</small></span><b>${money(t.spent)}</b></div>
+      ${t.budget ? `<div class="tot"><span class="muted">Budget</span><span class="muted">${money(t.budget)}</span></div>
+        <div class="meter ${t.spent > t.budget ? 'over' : ''}" aria-hidden="true"><span style="width:${Math.min(100, Math.round(t.spent / t.budget * 100))}%"></span></div>
+        <div class="tot grand ${t.spent > t.budget ? 'loss' : 'profit'}"><span>${t.spent > t.budget ? 'Over budget' : 'Left to spend'}</span><span>${money(Math.abs(t.left))}</span></div>`
+        : '<p class="muted" style="margin:6px 0 0;font-size:13px">No budget set. Add one under Project details to see what\'s left.</p>'}`;
+  }
+  renderLumber();
 }
 
-// ---------- lumber pickup: board feet to linear feet ----------
+// ---------- lumber to buy: board feet to linear feet ----------
 // A board foot is 1" thick x 12" wide x 1 ft long, so linear feet = board feet x 12 / (thickness x width).
-// The yard sells whole boards, so linear feet are rounded up to full board lengths.
+// The yard sells whole boards, so linear feet are rounded up to full board lengths. Board feet come from
+// what's typed in, else the cut list plus the waste allowance.
 const BOARD_LENGTH_FT = 10;
 
 function lumberNeeds(data, estimatedBf) {
   const l = data.lumber || {};
   const bf = l.bf === '' || l.bf == null ? estimatedBf : pos(l.bf);
-  // Until a thickness is chosen, assume the one the species' linked supplier item is sold in.
-  const linked = feed?.items.find(i => i.id === findSpecies(data.spec.species).source);
-  const quarters = pos(l.quarters) || parseInt(linked?.size) || 4;
+  const quarters = pos(l.quarters) || 4;
   const width = pos(l.width);
   if (!width) return { bf, quarters, width, feet: 0, boards: 0, buyBf: bf };
   const exactFeet = bf * 12 / (quarters / 4 * width);
@@ -1494,34 +1144,40 @@ function lumberNeeds(data, estimatedBf) {
   return { bf, quarters, width, exactFeet, feet, boards, buyBf: Math.round(feet * (quarters / 4) * width / 12 * 10) / 10 };
 }
 
-const lumberSummary = (data, n) =>
-  `${n.feet} linear ft of ${n.quarters}/4 ${data.spec.species || 'lumber'}, ${+n.width}" wide (${n.boards} \u00d7 ${BOARD_LENGTH_FT} ft board${n.boards === 1 ? '' : 's'})`;
+const lumberSummary = (data, n) => n.feet
+  ? `${n.feet} linear ft of ${n.quarters}/4 ${data.species || 'lumber'}, ${+n.width}" wide (${n.boards} × ${BOARD_LENGTH_FT} ft board${n.boards === 1 ? '' : 's'})`
+  : `About ${+n.bf} board feet of ${n.quarters}/4 ${data.species || 'lumber'}`;
 
-function renderLumber(calc) {
-  const d = ed.data, n = calc.lumber;
+function renderLumber() {
+  const d = ed.data, est = ed.project ? cutBoardFeet(ed.project) : 0, n = lumberNeeds(d, est);
   const sum = $('#foldSum');
-  if (sum) sum.textContent = [TYPES[d.spec.type]?.name, d.spec.species, [d.spec.length, d.spec.width, d.spec.height].every(x => num(x)) ? `${+d.spec.length} \u00d7 ${+d.spec.width} \u00d7 ${+d.spec.height} in` : '',
-    `${ed.stream === 'gallery' ? 'cost' : calc.agreed ? 'agreed' : ed.stream === 'client' ? 'quote' : 'retail'} ${money(ed.stream === 'gallery' ? calc.cost : calc.total)}`].filter(Boolean).join(' \u00b7 ');
+  if (sum && ed.project) {
+    const t = totals(ed.project);
+    sum.textContent = [d.area, d.species, t.budget ? `budget ${money(t.budget)}` : ''].filter(Boolean).join(' · ');
+  }
   if (ed.project) renderShopMini(ed.project);
-  $('[data-lumber="bf"]').placeholder = `Estimate: ${calc.board_feet}`;
+  $('[data-lumber="bf"]').placeholder = est ? `Cut list: ${est}` : 'e.g. 40';
   $('[data-lumber="quarters"]').value = n.quarters;
-  $('#lumberOut').innerHTML = n.feet
-    ? `<b>About ${esc(lumberSummary(d, n))}</b><br><span class="muted" style="font-size:13px">${+n.bf} board feet &times; 12 &divide; (${n.quarters / 4}" &times; ${+n.width}") = ${+n.exactFeet.toFixed(1)} ft,
-        rounded up to full ${BOARD_LENGTH_FT} ft boards. That is ${+n.buyBf} board feet to buy, which the materials cost above is based on.</span>`
-    : `<span class="muted">Enter the width of the boards available to see how many linear feet to buy, in full ${BOARD_LENGTH_FT} ft boards.</span>`;
+  const price = pos(findSpecies(d.species).price), cost = n.buyBf && price ? ` That's about ${money(n.buyBf * price)} at ${money(price)} a board foot.` : '';
+  $('#lumberOut').innerHTML = !n.bf
+    ? `<span class="muted">Type the board feet you need, or fill in the Cut list tab and it's worked out from that (plus ${+pos(store.settings.waste_pct)}% for waste).</span>`
+    : n.feet
+      ? `<b>About ${esc(lumberSummary(d, n))}</b><br><span class="muted" style="font-size:13px">${+n.bf} board feet &times; 12 &divide; (${n.quarters / 4}" &times; ${+n.width}") = ${+n.exactFeet.toFixed(1)} ft,
+        rounded up to full ${BOARD_LENGTH_FT} ft boards: ${+n.buyBf} board feet to buy.${esc(cost)}</span>
+        ${ed.project ? '<br><button type="button" class="btn small" data-addlumber style="margin-top:8px">Add to shopping list</button>' : ''}`
+      : `<span class="muted">${+n.bf} board feet.${esc(cost)} Enter the width of the boards available to see how many linear feet to buy, in full ${BOARD_LENGTH_FT} ft boards.</span>
+        ${ed.project ? '<br><button type="button" class="btn small" data-addlumber style="margin-top:8px">Add to shopping list</button>' : ''}`;
 }
 
 async function createProject() {
   if (ed.creating) return;
-  const stamp = new Date().toISOString(), stream = ed.stream, status = stream === 'client' ? 'draft' : 'planned';
-  if (stream !== 'client') Object.assign(ed.data, { client_name: '', client_email: '', client_phone: '', client_state: '', retainer: 0 });
-  const draft = {
-    stream, status,
-    stage: stream === 'product' ? 'building' : 'ideation', data: ed.data, calc: price(ed.data, stream), history: [{ status, at: stamp }], created_at: stamp, updated_at: stamp,
-  };
+  if (!String(ed.data.title || '').trim()) { toast('Give the project a name first.'); ($('[data-path="title"]') as HTMLElement)?.focus(); return; }
+  const stamp = new Date().toISOString(), stream = ed.stream, status = 'planned';
+  const draft: any = { stream, status, stage: 'ideation', data: ed.data, calc: {}, history: [{ status, at: stamp }], created_at: stamp, updated_at: stamp };
   // Every project gets its to-do list the moment it is created.
   draft.data.todo = defaultTodo(draft);
-  // The server gives the project its id and quote number.
+  draft.calc = totals(draft);
+  // The server gives the project its id.
   let project;
   ed.creating = true;
   try { project = await api('/api/projects', draft); }
@@ -1529,14 +1185,12 @@ async function createProject() {
   store.projects.push(project);
   saved.projects.set(project.id, JSON.stringify(project, unbusy));
   ed.dirty = false;
-  toast(stream === 'client' ? `Saved as ${project.quote_number}` : 'Project saved');
+  toast('Project saved');
   location.hash = `#/p/${project.id}`;
 }
 
 function renderStatusCard() {
-  const p = ed.project, client = isClient(p);
-  // A product run is finished when it ships, so its last step says so (and moves it to the Shipped phase).
-  const next = nextStepOf(p);
+  const p = ed.project, next = nextStepOf(p);
   $('#statusPill').className = `pill ${p.status}`;
   $('#statusPill').textContent = STATUS_NAME[p.status];
   const card = $('#statusCard');
@@ -1544,49 +1198,39 @@ function renderStatusCard() {
     <h2>Status</h2>
     <div class="actions">
       ${next ? `<button class="btn primary" data-status="${next[0]}">${next[1]}</button>` : ''}
-      ${p.status === 'sent' ? '<button class="btn danger" data-status="declined">Declined</button>' : ''}
       <select id="statusSelect" style="width:auto" aria-label="Change status">
-        ${statusesFor(streamOf(p)).map(([k, n]) => `<option value="${k}" ${k === p.status ? 'selected' : ''}>${n}</option>`).join('')}
+        ${STATUSES.map(([k, n]) => `<option value="${k}" ${k === p.status ? 'selected' : ''}>${n}</option>`).join('')}
       </select>
     </div>
     <div class="actions" style="margin-top:10px">${isFrozen(p)
       ? `<button class="btn" data-unfreeze="${p.id}">Unfreeze</button><span class="muted" style="font-size:13px">Frozen since ${esc(fmtDate(p.data.frozen.at))}</span>`
-      : archived(p) ? '' : `<button class="btn" data-freeze="${p.id}">Freeze project</button><span class="muted" style="font-size:13px">For a client who's gone quiet, or a long delay</span>`}</div>
+      : archived(p) ? '' : `<button class="btn" data-freeze="${p.id}">Freeze project</button><span class="muted" style="font-size:13px">For a project on hold: waiting on a contractor, the weather or the budget</span>`}</div>
     <label class="f" style="margin-top:12px"><span>Kind of project</span><select id="streamSelect">
       ${STREAMS.map(([k, n]) => `<option value="${k}" ${k === streamOf(p) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
-    <ul class="history">${p.history.map(h => `<li><span>${'frozen' in h ? (h.frozen ? `Frozen${h.note ? `: ${esc(h.note)}` : ''}` : 'Unfrozen') : h.stage ? `Phase: ${STAGE_NAME[h.stage]}` : STATUS_NAME[h.status]}</span><span>${esc(fmtDate(h.at))}</span></li>`).join('')}</ul>`;
+    <ul class="history">${p.history.map(h => `<li><span>${'frozen' in h ? (h.frozen ? `Frozen${h.note ? `: ${esc(h.note)}` : ''}` : 'Unfrozen') : h.stage ? `Phase: ${STAGE_NAME[h.stage] || esc(h.stage)}` : STATUS_NAME[h.status] || esc(h.status)}</span><span>${esc(fmtDate(h.at))}</span></li>`).join('')}</ul>`;
   card.querySelectorAll('[data-status]').forEach(b => b.addEventListener('click', () => setStatus(p, b.dataset.status)));
   renderNow(p);
   $('#statusSelect').addEventListener('change', e => setStatus(p, e.target.value));
   $('#streamSelect').addEventListener('change', e => setStream(p, e.target.value));
 }
 
-// Moves a project to another stream, carrying its status over to the nearest one that stream has.
-// Its phase carries over the same way, unless a board drop names the phase it lands in.
+// Moves a project to the other stream. A board drop also names the phase it lands in.
 function setStream(p, stream, stage = '') {
   if (stream === streamOf(p)) return;
-  const status = STATUS_IN_STREAM[stream === 'client' ? 'client' : 'own'][p.status] || p.status;
   p.stream = stream;
-  const carried = stage || stageOf(p);
-  if (carried !== p.stage) { p.stage = carried; p.history.push({ stage: carried, at: new Date().toISOString() }); }
-  p.calc = priceProject(p, stream);
+  if (stage && stage !== p.stage) { p.stage = stage; p.history.push({ stage, at: new Date().toISOString() }); }
   p.updated_at = new Date().toISOString();
-  if (status !== p.status) { p.status = status; p.history.push({ status, at: p.updated_at }); }
-  // Landing in Shipped closes a product run, and a run moved out of Shipped is open again. A finished
-  // piece moved into the product line counts as shipped.
-  if (isProduct(p) && !stage && p.status === 'complete') p.stage = 'shipped';
-  else if (isProduct(p)) syncShipped(p);
   persist();
   toast(`Moved to ${STREAM_NAME[stream]}`);
   route();
 }
 
-const STAGE_SHORT = { ideation: 'Idea', design: 'Design', build: 'Build', finishing: 'Finish', ready: 'Deliver', building: 'Build', packaging: 'Pack', shipped: 'Shipped' };
+const STAGE_SHORT = { ideation: 'Idea', design: 'Design', build: 'Build', install: 'Install' };
 let phaseDatesOpen = false;
 
 function renderStages() {
   const p = ed.project, current = stageIndex(p), today = ymd(new Date()), stages = stagesFor(p), last = lastPhase(p);
-  const undated = key => key === 'ideation' || key === 'shipped';
+  const undated = key => key === 'ideation';
   const el = $('#stages');
   const late = (key, i) => i === current && stageDue(p, key) && stageDue(p, key) < today;
   // Desktop: one button per phase with its due date under it.
@@ -1606,7 +1250,7 @@ function renderStages() {
   const phone = `<ol class="stepper" style="--steps:${stages.length}">${stages.map(([key, name], i) => `<li class="${i < current ? 'done' : i === current ? 'on' : ''}">
       <button type="button" data-stage="${key}" ${i === current ? 'aria-current="step"' : ''} aria-label="${name}"><span class="dot">${i < current ? '&#10003;' : i + 1}</span><span class="lbl">${STAGE_SHORT[key]}</span></button></li>`).join('')}</ol>
     <div class="pdates">
-      ${main.map(({ key, i }) => dateRow(key, i, i === current && key !== last ? `${STAGE_NAME[key]} due` : isProduct(p) ? 'Ship by' : 'Delivery due')).join('')}
+      ${main.map(({ key, i }) => dateRow(key, i, i === current && key !== last ? `${STAGE_NAME[key]} due` : 'Install due')).join('')}
       ${rest.length ? `<details ${phaseDatesOpen ? 'open' : ''}><summary>Other phase dates${rest.some(({ key }) => stageDue(p, key)) ? '' : ' (none set)'}</summary>
         ${rest.map(({ key, i }) => dateRow(key, i, STAGE_NAME[key])).join('')}</details>` : ''}
     </div>`;
@@ -1654,8 +1298,8 @@ function onDatePicked(input, done) {
 
 // Phase due dates run in order: a phase can't be due before the one ahead of it, or after the one
 // that follows. Two phases due the same day is fine.
-const datedPhases = p => stagesFor(p).map(([key]) => key).filter(key => key !== 'ideation' && key !== 'shipped');
-const dueLabelOf = (p, key) => key === lastPhase(p) ? (isProduct(p) ? 'Ship by' : 'Delivery due') : `${STAGE_NAME[key]} due`;
+const datedPhases = p => stagesFor(p).map(([key]) => key).filter(key => key !== 'ideation');
+const dueLabelOf = (p, key) => key === lastPhase(p) ? 'Install due' : `${STAGE_NAME[key]} due`;
 function phaseDateBounds(p, key) {
   const keys = datedPhases(p), i = keys.indexOf(key);
   const before = keys.slice(0, i).map(k => ({ key: k, due: stageDue(p, k) })).filter(x => x.due);
@@ -1686,23 +1330,9 @@ function setStage(p, stage) {
   p.stage = stage;
   p.updated_at = new Date().toISOString();
   p.history.push({ stage, at: p.updated_at });
-  if (isProduct(p)) syncShipped(p);
+  // Moving a planned project past Ideation means work has started.
+  if (p.status === 'planned' && stage !== 'ideation') { p.status = 'in_progress'; p.history.push({ status: 'in_progress', at: p.updated_at }); }
   persist();
-}
-
-// For the product line, Shipped and Complete are the same thing: reaching one sets the other, which
-// closes the run out to the archive. Taking a run back out of Shipped (or Complete) reopens it.
-function syncShipped(p) {
-  const at = p.updated_at || new Date().toISOString();
-  if (stageOf(p) === 'shipped' && p.status !== 'complete') {
-    p.status = 'complete';
-    p.history.push({ status: 'complete', at });
-    finishTodo(p);
-    toast(`${projectName(p)} shipped and closed out`);
-  } else if (stageOf(p) !== 'shipped' && p.status === 'complete') {
-    p.status = 'in_progress';
-    p.history.push({ status: 'in_progress', at });
-  }
 }
 
 async function setStatus(p, status) {
@@ -1710,22 +1340,6 @@ async function setStatus(p, status) {
   p.status = status;
   p.updated_at = new Date().toISOString();
   p.history.push({ status, at: p.updated_at });
-  // The to-do list follows along: a quote marked sent ticks "Send the quote", and an accepted one asks
-  // whether the deposit is in.
-  const tick = text => {
-    const t = p.data.todo?.items.find(x => !x.done_at && x.text === text);
-    if (!t) return false;
-    t.done_at = p.updated_at;
-    p.data.todo.log.push({ at: p.updated_at, what: 'done', text, list: 'items' });
-    return true;
-  };
-  if (isClient(p) && status !== 'draft' && status !== 'declined') tick('Send the quote');
-  if (isClient(p) && status === 'accepted' && p.data.todo?.items.some(x => !x.done_at && x.text === 'Collect deposit')
-    && confirm(`Has the deposit for ${projectName(p)} come in?\n\nOK ticks "Collect deposit" on its to-do list.`)) tick('Collect deposit');
-  if (isProduct(p) && (status === 'complete') !== (stageOf(p) === 'shipped')) {
-    p.stage = status === 'complete' ? 'shipped' : 'packaging';
-    p.history.push({ stage: p.stage, at: p.updated_at });
-  }
   if (isFinished(p)) finishTodo(p);
   persist();
   if (ed?.project === p) renderStatusCard();
@@ -1755,7 +1369,6 @@ function unfreezeProject(p) {
     const later = d => { const x = new Date(d + 'T00:00'); x.setDate(x.getDate() + days); return ymd(x); };
     if (p.data.due_date) p.data.due_date = later(p.data.due_date);
     for (const [k, d] of Object.entries(p.data.stage_due || {})) if (d) p.data.stage_due[k] = later(d);
-    if (isBatch(p)) p.data.batch.ship_manual = true;
   }
   delete p.data.frozen;
   const at = new Date().toISOString();
@@ -1776,12 +1389,12 @@ function showFrozen() {
   };
   view.innerHTML = `<a href="${boardLink()}" class="back">&larr; Projects</a>
     <div class="pagehead"><h1>Frozen projects</h1></div>
-    <p class="muted">Projects on hold: a client who's gone quiet but may come back, or a job with a long delay. They stay off the board and calendar.
+    <p class="muted">Projects on hold: waiting on a contractor, the weather, the budget or a free weekend. They stay off the board and calendar.
       Unfreezing one puts it back on the board where it left off.</p>
     ${list.length ? `<div class="card"><table class="list frozenlist">
-      <tr><th>Project</th><th>Client or stream</th><th>Where it was</th><th>Frozen since</th><th>Why</th><th></th></tr>
-      ${list.map(p => `<tr><td><a href="#/p/${p.id}">${esc(projectName(p))}</a>${isClient(p) ? `<br><small class="muted">${esc(p.quote_number)}</small>` : ''}</td>
-        <td>${isClient(p) ? esc(p.data.client_name || 'No client yet') : STREAM_NAME[streamOf(p)]}</td>
+      <tr><th>Project</th><th>Stream</th><th>Where it was</th><th>Frozen since</th><th>Why</th><th></th></tr>
+      ${list.map(p => `<tr><td><a href="#/p/${p.id}">${esc(projectName(p))}</a></td>
+        <td>${STREAM_NAME[streamOf(p)]}</td>
         <td><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span> <span class="muted">${STAGE_NAME[stageOf(p)]}</span></td>
         <td>${since(p)}</td><td>${esc(p.data.frozen.reason)}</td>
         <td><button class="btn small" data-unfreeze="${p.id}">Unfreeze</button></td></tr>`).join('')}
@@ -1799,46 +1412,27 @@ view.addEventListener('click', e => {
 });
 
 // ---------- to-do lists ----------
-// Every project has its own to-do list and lumber store shopping list, made when the project is
-// created and kept in its data as data.todo = { items, lumber, log }. Each entry is { id, text, done_at }
-// (done_at is null while open); the log records every task added, checked off, unchecked or removed.
-// Checked-off tasks stay where they are, struck through, so they can be unchecked later. When a project
-// is finished (marked Complete, or for a client job Delivered & paid if it skipped Complete) everything is checked off.
+// Every project has its own to-do list and shopping list, made when the project is created and kept in
+// its data as data.todo = { items, lumber, log } (`lumber` is the shopping list: it started out as the
+// lumber store list). Each entry is { id, text, done_at } (done_at is null while open); the log records
+// every task added, checked off, unchecked or removed. Checked-off tasks stay where they are, struck
+// through, so they can be unchecked later. When a project is marked Complete everything is checked off.
 const TODO_LISTS = { items: 'To-do list', lumber: 'Shopping list' };
 let taskSeq = 0;
 const newTask = (text, extra = {}) => ({ id: `t${Date.now().toString(36)}${(taskSeq++).toString(36)}`, text, done_at: null, ...extra });
-const isFinished = p => p.status === 'complete' || (isClient(p) && p.status === 'delivered');
+const isFinished = p => p.status === 'complete';
 
-// The shopping list's first line: the lumber to buy, worked out from the project's size and species.
-function lumberLine(p) {
-  if (isBatch(p)) {
-    const b = p.data.batch;
-    return `Materials for ${batchUnits(b)} × ${b.product}${b.materials ? ` (each: ${b.materials})` : ''}`;
-  }
-  const n = p.calc?.lumber, species = p.data.spec?.species || 'lumber';
-  return n?.feet ? `${lumberSummary(p.data, n)}` : `About ${+(n?.buyBf ?? p.calc?.board_feet ?? 0)} board feet of ${species}`;
-}
-
-// The starting list for a project: the steps of the job, from quote (or materials) to final payment.
+// The starting list for a project: the usual steps for its kind, which are easy to change or remove.
+const STARTER_TODOS = {
+  home: ['Measure the space', 'Pick materials and finishes', 'Check whether a permit is needed', 'Get quotes for any work we won\'t do ourselves',
+    'Buy materials', 'Prep the area', 'Do the work', 'Patch, paint and touch up', 'Clean up'],
+  shop: ['Sketch the design', 'Make the cut list', 'Buy lumber and hardware', 'Mill the stock', 'Cut the joinery', 'Glue up',
+    'Sand', 'Finish', 'Install or move it into place'],
+};
 function defaultTodo(p) {
-  const d = p.data, client = isClient(p);
-  let steps;
-  if (isBatch(p)) {
-    const b = d.batch, units = batchUnits(b);
-    steps = [`Buy materials for ${units} × ${b.product}`,
-      ...b.variants.filter(v => pos(v.qty) > 0).map(v => `Make ${pos(v.qty)} × ${variantLabel(b, v)}`),
-      `Ship ${units} × ${b.product}`];
-  } else {
-    steps = [
-      ...(client ? ['Send the quote', 'Collect deposit'] : []),
-      'Buy lumber & hardware',
-      ...(d.phases || []).filter(ph => pos(ph.hours) > 0 && ph.name).map(ph => ph.name),
-      ...(client ? ['Collect final payment'] : []),
-    ];
-  }
   return {
-    items: steps.map(text => newTask(text)),
-    lumber: [newTask(lumberLine(p), { auto: true })],   // auto: follows the estimate until it is checked off
+    items: STARTER_TODOS[streamOf(p)].map(text => newTask(text)),
+    lumber: [],
     log: [{ at: new Date().toISOString(), what: 'created' }],
   };
 }
@@ -1849,7 +1443,6 @@ function backfillTodos() {
   for (const p of store.projects) {
     if (p.data.todo) continue;
     const todo = defaultTodo(p);
-    if (isClient(p) && p.status !== 'draft') todo.items[0].done_at = p.history.find(h => h.status === 'sent')?.at || p.updated_at;
     if (isFinished(p) || archived(p)) {
       const at = p.history.findLast(h => h.status)?.at || p.updated_at;
       for (const t of [...todo.items, ...todo.lumber]) t.done_at ??= at;
@@ -1920,7 +1513,7 @@ function showTasks() {
       : due ? `<span class="${due < today ? 'late' : ''}">due ${esc(fmtDate(due))}</span>` : '';
     return `<a class="card taskproj ${kind}" href="#/tasks/${p.id}"${kind === 'active' ? ` data-id="${p.id}" draggable="false"` : ''}>
       <div class="name"><b>${esc(projectName(p))}</b><span class="pill ${p.status}">${STATUS_NAME[p.status]}</span></div>
-      <span class="muted" style="font-size:13px">${isClient(p) ? esc(p.data.client_name || p.quote_number) : STREAM_NAME[streamOf(p)]}${note ? ` &middot; ${note}` : ''}</span>
+      <span class="muted" style="font-size:13px">${esc(whereOf(p))}${note ? ` &middot; ${note}` : ''}</span>
       <div class="progress" aria-hidden="true"><span style="width:${c.total ? Math.round(c.done / c.total * 100) : 0}%"></span></div>
       <span style="font-size:13px">${c.total ? `${c.done} of ${c.total} done` : 'No tasks yet'}${c.next && kind !== 'finished' ? `<br><span class="muted">Next: ${esc(c.next.text)}</span>` : ''}</span>
     </a>`;
@@ -1975,7 +1568,7 @@ function showAllTodos() {
       const due = p.data.due_date;
       return `<section class="card todogroup" data-project="${p.id}">
         <div class="shophead"><a href="#/tasks/${p.id}"><b>${esc(projectName(p))}</b></a>
-          <span class="muted">${isClient(p) ? esc(p.data.client_name || p.quote_number) : STREAM_NAME[streamOf(p)]}${due ? ` &middot; <span class="${due < today ? 'late' : ''}">due ${esc(fmtDate(due))}</span>` : ''} &middot; ${left} to do</span></div>
+          <span class="muted">${esc(whereOf(p))}${due ? ` &middot; <span class="${due < today ? 'late' : ''}">due ${esc(fmtDate(due))}</span>` : ''} &middot; ${left} to do</span></div>
         <ul class="tasks">${items.map(t => `<li class="task ${t.done_at ? 'done' : ''}" data-id="${esc(t.id)}">
           <input type="checkbox" ${t.done_at ? 'checked' : ''} aria-label="${esc(t.text)}"><span class="text">${esc(t.text)}</span>
           ${t.done_at ? `<span class="when">Done ${esc(fmtDate(t.done_at))}</span>` : ''}</li>`).join('')}</ul>
@@ -2002,7 +1595,7 @@ function showAllTodos() {
   });
 }
 
-// One project's to-do list, its lumber store shopping list and the log of everything done.
+// One project's to-do list, its shopping list and the log of everything done.
 function showTodo(p) {
   if (!p.data.todo) { p.data.todo = defaultTodo(p); todoChanged(p); }
   const todo = p.data.todo;
@@ -2016,7 +1609,7 @@ function showTodo(p) {
       </div>
       <aside>
         <div class="card">
-          <h2>Lumber store shopping list</h2>
+          <h2>Shopping list</h2>
           <form class="addtask" data-list="lumber" id="lumberAdd" autocomplete="off"><textarea rows="1" enterkeyhint="done" placeholder="Add something to buy" aria-label="New shopping list item"></textarea><button class="btn primary">Add</button></form>
           <ul class="tasks" data-list="lumber"></ul>
           <p class="muted hint">Paste a list (one item per line) to add every item at once.</p>
@@ -2028,7 +1621,6 @@ function showTodo(p) {
   const draw = list => {
     const ul = $(`ul[data-list="${list}"]`);
     // The lumber line follows the project's estimate until it is checked off or edited.
-    if (list === 'lumber') for (const t of todo.lumber) if (t.auto && !t.done_at) t.text = lumberLine(p);
     ul.innerHTML = todo[list].length ? todo[list].map(t => `<li class="task ${t.done_at ? 'done' : ''}" data-id="${esc(t.id)}">
         <input type="checkbox" ${t.done_at ? 'checked' : ''} aria-label="${esc(t.text)}">
         <span class="text">${esc(t.text)}</span>
@@ -2051,7 +1643,6 @@ function showTodo(p) {
     const t = find(list, id);
     if (!t) return;
     t.done_at = t.done_at ? null : new Date().toISOString();
-    if (t.done_at) delete t.auto;
     todoChanged(p, { what: t.done_at ? 'done' : 'undone', text: t.text, list });
     redraw();
   };
@@ -2153,7 +1744,7 @@ const tasksTabs = on => `<nav class="tabs">
     store.projects.filter(p => !archived(p) && !isFrozen(p)).reduce((n, p) => n + (p.data.todo?.lumber || []).filter(t => !t.done_at).length, 0) || ''}</small></a>
 </nav>`;
 
-// Every active project's lumber store shopping list in one place, to take to the store and check off.
+// Every active project's shopping list in one place, to take to the store and check off.
 // It opens sorted by wood species, as a clean checklist of thickness, width, length and how many (read
 // from each item's wording, see readLumber); "By project" shows each project's list as written. Checking an item here checks it off on the project's own list (and logs it there).
 // Items checked in the last week stay visible, struck through, so a mis-tap can be undone; older ones
@@ -2168,13 +1759,12 @@ function showShopping() {
     let open = 0, withItems = 0;
     const groups = projects.map(p => {
       const lumber = p.data.todo?.lumber || [];
-      for (const t of lumber) if (t.auto && !t.done_at) t.text = lumberLine(p);   // follows the estimate, as on the project's page
       const items = lumber.filter(shown), left = lumber.filter(t => !t.done_at).length;
       open += left;
       if (left) withItems++;
       return `<section class="card shopgroup" data-project="${p.id}">
         <div class="shophead"><a href="#/tasks/${p.id}"><b>${esc(projectName(p))}</b></a>
-          <span class="muted">${isClient(p) ? esc(p.data.client_name || p.quote_number) : STREAM_NAME[streamOf(p)]}${left ? ` &middot; ${left} to buy` : ''}</span></div>
+          <span class="muted">${esc(whereOf(p))}${left ? ` &middot; ${left} to buy` : ''}</span></div>
         <ul class="tasks">${items.map(t => `<li class="task ${t.done_at ? 'done' : ''}" data-id="${esc(t.id)}">
           <input type="checkbox" ${t.done_at ? 'checked' : ''} aria-label="${esc(t.text)}"><span class="text">${esc(t.text)}</span>
           ${t.done_at ? `<span class="when">Done ${esc(fmtDate(t.done_at))}</span>` : ''}</li>`).join('')
@@ -2193,7 +1783,7 @@ function showShopping() {
   };
   // Every item still to buy (and any checked this week), as one checklist per species, thickest first.
   const bySpecies = () => {
-    const rows = projects.flatMap(p => (p.data.todo?.lumber || []).filter(shown).map(t => ({ p, t, l: readLumber(t.text, t.auto ? p.data.spec?.species : '') })));
+    const rows = projects.flatMap(p => (p.data.todo?.lumber || []).filter(shown).map(t => ({ p, t, l: readLumber(t.text) })));
     const groups = new Map();
     for (const r of rows) {
       const key = r.l.species || (r.l.lumber ? 'Species not given' : 'Other supplies');
@@ -2256,7 +1846,7 @@ function showShopping() {
     const t = p.data.todo.lumber.find(x => x.id === li.dataset.id);
     if (!t) return;
     t.done_at = t.done_at ? null : new Date().toISOString();
-    if (t.done_at) { delete t.auto; boughtFor.add(p.id); }
+    if (t.done_at) boughtFor.add(p.id);
     todoChanged(p, { what: t.done_at ? 'done' : 'undone', text: t.text, list: 'lumber' });
     draw();
   });
@@ -2415,385 +2005,9 @@ function longPressReorder(ul, drop, item = 'li.task') {
   return { justMoved: () => Date.now() < movedUntil };
 }
 
-// ---------- small-batch product runs ----------
-// A batch run is a product-line project made from one of the catalog's products (Settings → Products):
-// so many units, split by variant, to be in the mail by a ship-by date (the project's due date). The
-// product's per-unit price, cost, time and materials are copied in when the run is created, so later
-// catalog edits don't change runs already under way.
-function isBatch(p) { return !!p.data.batch; }
-function batchUnits(b) { return b.variants.reduce((n, v) => n + pos(v.qty), 0); }
-const variantLabel = (b, v) => v.name ? `${b.product} (${v.name})` : b.product;
-
-function batchCalc(data) {
-  const b = data.batch, units = batchUnits(b);
-  const hours = cents(units * pos(b.unit_hours)), laborCost = cents(hours * pos(data.rates?.hourly_rate ?? store.settings.hourly_rate));
-  const materials = cents(units * pos(b.unit_cost));
-  const total = cents(b.variants.reduce((sum, v) => sum + pos(v.qty) * pos(v.price ?? b.unit_price), 0));
-  return {
-    units, board_feet: 0, lumber: { bf: 0, quarters: 4, width: 0, feet: 0, boards: 0, buyBf: 0 },
-    labor_hours: hours, contingency_hours: 0, labor_cost: laborCost, materials_est: materials, materials_cost: materials, other_costs: 0,
-    cost: cents(laborCost + materials), subtotal: total, tax: 0, total, retainer: 0, balance: total, deposit: 0,
-  };
-}
-function priceProject(p, stream = streamOf(p)) { return isBatch(p) ? batchCalc(p.data) : price(p.data, stream); }
-
-// "Wave / Black Walnut / Silver/Blue" -> { head: 'Wave', rest: 'Black Walnut / Silver/Blue' }.
-function qbGroup(name) {
-  const parts = String(name || '').split(' / ');
-  return parts.length > 1 ? { head: parts[0], rest: parts.slice(1).join(' / ') } : null;
-}
-
-// The quick form at the top of the Product line tab. It starts closed (just its header) each time the
-// app opens, stays open while you use it, and closes again once a run is added.
-let qbOpen = false;
-function renderQuickBatch() {
-  const card = $('#quickBatch'), products = (store.settings.products || []).filter(x => x.listed !== false);
-  if (!products.length) {
-    card.innerHTML = `<h2>Quick batch run</h2><p class="muted" style="margin:0">${shopState === 'failed'
-      ? "Your products couldn't be loaded from jmwood.work just now. Reload the page to try again." : 'Loading your products from jmwood.work&hellip;'}</p>`;
-    return;
-  }
-  let chosen = products[0].id;
-  const product = () => products.find(x => x.id === chosen) || products[0];
-  const draw = () => {
-    const pr = product(), variants = pr.variants.length ? pr.variants : [{ name: '', price: 0 }];
-    // On a phone, variants named like "Wave / Black Walnut / Silver/Blue" are grouped under their first option
-    // ("Wave"), so each row only needs the rest. Only when that actually groups something.
-    const heads = variants.map(v => qbGroup(v.name)?.head);
-    const groups = variants.length > 2 && heads.every(Boolean) && new Set(heads).size < variants.length;
-    card.classList.toggle('closed', !qbOpen);
-    card.innerHTML = `<div class="actions qbhead"><h2 style="margin:0"><button type="button" class="qbtoggle" aria-expanded="${qbOpen}"><span class="qbchev" aria-hidden="true">&#9656;</span> Quick batch run</button></h2><span style="flex:1"></span><a href="#/products" style="font-size:13px">Edit products</a></div>
-      ${store.shopifyConnected ? '<p class="muted" style="margin:-4px 0 12px;font-size:13px">Your Shopify orders fill a run for each product on their own. Use this for anything extra, like stock for a market.</p>' : ''}
-      <form id="batchForm" class="grid" autocomplete="off">
-        <label class="f"><span>Product</span><select id="qbProduct">${products.map(x => `<option value="${esc(x.id)}" ${x.id === pr.id ? 'selected' : ''}>${esc(x.name || 'Unnamed product')}</option>`).join('')}</select></label>
-        <div class="f w6"><span>${variants.length > 1 ? 'How many of each variant' : 'How many'}</span><div class="qbvariants">
-          ${variants.map((v, i) => {
-            const g = groups && qbGroup(v.name), prev = groups && i > 0 && qbGroup(variants[i - 1].name);
-            return `${g && g.head !== prev?.head ? `<div class="qbgroup">${esc(g.head)}</div>` : ''}<label class="qbv">
-              <span class="qbname" title="${esc(v.name)}">${g ? `<span class="qlong">${esc(v.name)}</span><span class="qshort">${esc(g.rest)}</span>` : esc(v.name || 'Units')} <small>${money(v.price)}</small></span>
-              <span class="qbctl"><button type="button" class="btn small" data-step="-1" tabindex="-1" aria-label="One fewer">&minus;</button><input type="number" inputmode="numeric" min="0" step="1" data-v="${i}" value="${variants.length === 1 ? 1 : ''}" placeholder="0"><button type="button" class="btn small" data-step="1" tabindex="-1" aria-label="One more">+</button></span>
-            </label>`;
-          }).join('')}
-        </div></div>
-        <label class="f"><span>In the mail by</span><input type="date" id="qbShip" required></label>
-        <div class="f w6 actions qbsubmit"><button class="btn primary" type="submit">Add batch run</button><span class="muted" id="qbTotal"></span></div>
-      </form>`;
-    const form = $('#batchForm', card);
-    const qtys = () => [...form.querySelectorAll('[data-v]')].map(el => ({ ...variants[Number(el.dataset.v)], qty: Math.round(pos(el.value)) }));
-    const total = () => {
-      const list = qtys(), units = list.reduce((n, v) => n + v.qty, 0);
-      $('#qbTotal', card).textContent = units ? `${units} unit${units === 1 ? '' : 's'} \u00b7 ${money(list.reduce((sum, v) => sum + v.qty * pos(v.price), 0))} retail` : '';
-      return units;
-    };
-    total();
-    $('.qbtoggle', card).addEventListener('click', () => { qbOpen = !qbOpen; draw(); });
-    $('#qbProduct', card).addEventListener('change', e => { chosen = e.target.value; draw(); });
-    form.addEventListener('input', total);
-    // The phone's - / + buttons beside each variant.
-    form.addEventListener('click', e => {
-      const step = (e.target as HTMLElement).closest('[data-step]') as HTMLElement;
-      if (!step) return;
-      e.preventDefault();
-      const input = step.parentElement.querySelector('input') as HTMLInputElement;
-      const n = Math.max(0, Math.round(pos(input.value)) + Number(step.dataset.step));
-      input.value = n ? String(n) : '';
-      mark();
-      total();
-    });
-    const mark = () => form.querySelectorAll('.qbv').forEach(row => row.classList.toggle('some', pos((row.querySelector('input') as HTMLInputElement).value) > 0));
-    form.addEventListener('input', mark);
-    mark();
-    form.addEventListener('submit', async e => {
-      e.preventDefault();
-      if (!total()) return toast('Enter how many to make.');
-      const ship = $('#qbShip', card).value;
-      if (!ship) return toast('Choose the date they need to be in the mail.');
-      const button = form.querySelector('button[type=submit]');
-      button.disabled = true;
-      const made = await createBatch(pr, qtys(), ship);
-      button.disabled = false;
-      if (made) qbOpen = false;
-      if (made && location.hash.startsWith('#/s/product')) showBoard();
-    });
-  };
-  draw();
-}
-
-async function createBatch(pr, qtys, ship, opts: { source?: string; quiet?: boolean } = {}) {
-  const stamp = new Date().toISOString(), s = store.settings, status = 'in_progress', stamped = Date.now();
-  const data = {
-    ...blankData(), title: pr.name || 'Product', due_date: ship, retainer: 0,
-    spec: { ...blankData().spec, type: 'custom', species: '', description: '' },
-    lumber: { bf: '', quarters: '', width: '' },
-    batch: {
-      product_id: pr.id, product: pr.name || 'Product',
-      unit_cost: pos(pr.unit_cost), unit_hours: pos(pr.unit_hours), materials: pr.materials || '',
-      // Only the variants being made; others can be added on the run's page.
-      variants: qtys.filter(v => v.qty > 0).map((v, i) => ({ id: `v${stamped}${i}`, name: v.name, price: pos(v.price), qty: v.qty,
-        ...(opts.source === 'shopify' ? { ordered: v.qty, extra: 0 } : {}) })),
-      ...(opts.source ? { source: opts.source } : {}),
-    },
-  };
-  data.rates.hourly_rate = s.hourly_rate;
-  // Starts in Building and In progress: it is a real order, and materials can be bought straight away.
-  const draft = { stream: 'product', status, stage: 'building', data, calc: batchCalc(data), history: [{ status, at: stamp }], created_at: stamp, updated_at: stamp };
-  (draft.data as any).todo = defaultTodo(draft);
-  let project;
-  try { project = await api('/api/projects', draft); }
-  catch (e) { if (!opts.quiet) toast(`Not saved: ${e.message}`); return null; }
-  store.projects.push(project);
-  saved.projects.set(project.id, JSON.stringify(project, unbusy));
-  toast(`${opts.source === 'shopify' ? 'New Shopify orders: added' : 'Added'} ${projectName(project)}`);
-  return project;
-}
-
-// A batch run's own page: units by variant with quick + / - buttons, the ship-by date and status.
-function showBatch(p) {
-  const b = p.data.batch;
-  ed = { project: p, stream: streamOf(p), data: p.data, dirty: false };
-  view.innerHTML = `
-    ${projectHeader(p, 'details', '<span class="muted">Changes save automatically</span>')}
-    <div id="nowStrip" hidden></div>
-    <div class="stages" id="stages" role="group" aria-label="Project phase"></div>
-    <div class="cols">
-      <div>
-        <div class="card" id="units"></div>
-        <div class="card">
-          <div class="grid">
-            <label class="f"><span>In the mail by</span><input type="date" id="shipBy" value="${esc(p.data.due_date)}"></label>
-            <label class="f w6"><span>Notes</span><textarea id="batchNotes" placeholder="Order numbers, who it's for, packaging...">${esc(p.data.notes)}</textarea></label>
-          </div>
-        </div>
-      </div>
-      <aside>
-        <div class="card" id="purchasesCard"></div><div class="card" id="statusCard"></div>
-        <p class="noprint" style="text-align:right"><button class="link" id="delete" style="color:var(--bad)">Delete this run</button></p>
-      </aside>
-    </div>`;
-
-  const touch = () => {
-    p.calc = batchCalc(p.data);
-    p.updated_at = new Date().toISOString();
-    $('#projTitle').textContent = projectName(p);
-    persist();
-  };
-  const units = $('#units');
-  const renderUnits = () => {
-    const n = batchUnits(b), calc = p.calc;
-    const unused = (store.settings.products.find(x => x.id === b.product_id)?.variants || []).filter(x => !b.variants.some(v => v.name === x.name));
-    units.innerHTML = `<h2>Units to make</h2>
-      ${fromShop(b) ? `<p class="note">Kept up to date from your Shopify orders${b.orders?.length ? `: ${b.orders.map(o => esc(o.name)).join(', ')}` : ' (none open right now)'}.
-        Use &minus; / + to make more or fewer than ordered.</p>` : ''}
-      ${b.variants.map((v, i) => `<div class="qty">
-        <span>${esc(v.name || b.product)} <small class="muted">${money(v.price ?? b.unit_price)}${fromShop(b) ? ` &middot; ${pos(v.ordered)} ordered${v.extra ? `, ${v.extra > 0 ? '+' : ''}${v.extra} by hand` : ''}` : ''}</small></span>
-        <button type="button" class="btn small" data-step="-1" data-i="${i}" aria-label="One fewer ${esc(v.name || 'unit')}">&minus;</button>
-        <input type="number" min="0" step="1" data-i="${i}" value="${pos(v.qty)}" aria-label="${esc(v.name || 'Units')}">
-        <button type="button" class="btn small" data-step="1" data-i="${i}" aria-label="One more ${esc(v.name || 'unit')}">+</button>
-        <button type="button" class="link" data-remove="${i}" ${b.variants.length === 1 || pos(v.ordered) > 0 ? 'hidden' : ''}>remove</button>
-      </div>`).join('')}
-      <div class="actions" style="margin-top:10px">
-        <select id="addVariant" style="width:auto" aria-label="Variant to add">${unused.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${money(x.price)})</option>`).join('')}<option value="">Other&hellip;</option></select>
-        <button type="button" class="btn small" id="addVariantBtn">+ Add variant</button>
-      </div>
-      <hr class="rule">
-      <div class="tot grand"><span>Total units</span><span>${n}</span></div>
-      <div class="tot"><span>Retail value</span><span>${money(calc.total)}</span></div>
-      <div class="tot"><span class="muted">Cost to make <small>materials${b.unit_hours ? ' and time' : ''}</small></span><span class="muted">${money(calc.cost)}</span></div>
-      ${b.unit_hours ? `<div class="tot"><span class="muted">Shop time</span><span class="muted">${hrs(calc.labor_hours)}</span></div>` : ''}
-      ${b.materials ? `<p class="muted" style="margin:10px 0 0;font-size:13px">Materials per unit: ${esc(b.materials)}</p>` : ''}`;
-  };
-  units.addEventListener('click', e => {
-    const el = e.target.closest('button');
-    if (!el) return;
-    if (el.dataset.step) {
-      setVariantQty(b, b.variants[el.dataset.i], Math.round(pos(b.variants[el.dataset.i].qty)) + Number(el.dataset.step));
-    } else if (el.dataset.remove !== undefined) {
-      b.variants.splice(Number(el.dataset.remove), 1);
-    } else if (el.id === 'addVariantBtn') {
-      const listed = store.settings.products.find(x => x.id === b.product_id)?.variants || [];
-      const name = $('#addVariant').value || prompt('Name of the variant')?.trim();
-      if (!name) return;
-      b.variants.push({ id: `v${Date.now()}`, name, price: pos(listed.find(x => x.name === name)?.price ?? b.variants[0]?.price), qty: 1, ...(fromShop(b) ? { ordered: 0, extra: 1 } : {}) });
-    } else return;
-    touch();
-    renderUnits();
-  });
-  units.addEventListener('change', e => {
-    const el = e.target;
-    if (el.dataset.i === undefined || el.tagName !== 'INPUT') return;
-    setVariantQty(b, b.variants[el.dataset.i], Math.round(pos(el.value)));
-    touch();
-    renderUnits();
-  });
-  onDatePicked($('#shipBy'), () => {
-    const input = $('#shipBy');
-    if (setPhaseDue(p, lastPhase(p), input.value)) { b.ship_manual = true; touch(); } else input.value = p.data.due_date || '';
-    renderStages();
-  });
-  $('#batchNotes').addEventListener('input', e => { p.data.notes = e.target.value; touch(); });
-  $('#delete').addEventListener('click', () => {
-    if (!confirm(`Delete ${projectName(p)}? This cannot be undone.`)) return;
-    store.projects = store.projects.filter(x => x !== p);
-    persist();
-    location.hash = boardLink();
-  });
-  // The phase strip's last date is the ship-by date too, so keep the two in step.
-  $('#stages').addEventListener('phasedate', () => { $('#shipBy').value = p.data.due_date || ''; b.ship_manual = true; });
-  ed.redraw = () => { $('#shipBy').value = p.data.due_date || ''; renderUnits(); renderStages(); renderStatusCard(); $('#projTitle').textContent = projectName(p); };
-  renderUnits();
-  renderStages();
-  renderStatusCard();
-  renderPurchasesCard(p);
-}
-
-// ---------- product catalog (for batch runs) ----------
-// Products, variants and prices come from the jmwood.work shop: the server reads the collection shown
-// on its Small Batch Projects page. They are copied into the settings so the form works offline too;
-// what it costs to make each unit, how long it takes and what to buy are filled in on the Products page.
-let shopState = 'loading';   // 'loading', 'ok' or 'failed'
-async function loadShopProducts() {
-  let shop;
-  try {
-    const res = await fetch('/api/shop-products', { cache: 'no-cache' });
-    shop = res.ok ? await res.json() : null;
-  } catch { shop = null; }
-  if (!Array.isArray(shop?.products)) {
-    shopState = 'failed';
-    if ($('#quickBatch') && !(store.settings.products || []).length) renderQuickBatch();
-    return;
-  }
-  shopState = 'ok';
-  const s = store.settings, before = JSON.stringify(s.products || []);
-  s.products ??= [];
-  for (const item of shop.products) {
-    let pr = s.products.find(x => x.handle === item.handle);
-    if (!pr) s.products.push(pr = { id: item.handle, handle: item.handle, unit_cost: 0, unit_hours: 0, materials: '' });
-    Object.assign(pr, { name: item.title, variants: item.variants, listed: true });
-  }
-  // Taken off the shop: kept (with its notes) in case it comes back, but not offered for new runs.
-  for (const pr of s.products) if (pr.handle && !shop.products.some(x => x.handle === pr.handle)) pr.listed = false;
-  s.products.sort((a, b) => shop.products.findIndex(x => x.handle === a.handle) - shop.products.findIndex(x => x.handle === b.handle));
-  if (JSON.stringify(s.products) !== before) settingsChanged();
-  if ($('#quickBatch')) renderQuickBatch();
-  else if (currentHash.startsWith('#/products')) showProducts();
-}
-
-function showProducts() {
-  const s = store.settings, products = (s.products ||= []).filter(x => x.listed !== false);
-  const range = pr => {
-    const prices = pr.variants.map(v => pos(v.price));
-    const lo = Math.min(...prices), hi = Math.max(...prices);
-    return !prices.length ? '' : lo === hi ? money(lo) : `${money(lo)} to ${money(hi)}`;
-  };
-  view.innerHTML = `<a href="#/s/product" class="back">&larr; Product line</a>
-    <div class="pagehead"><h1>Products</h1><span class="spacer"></span><span class="muted">Changes save automatically</span></div>
-    <p class="muted">Products, variants and prices come from the Small Batch Projects page on jmwood.work, so change them in Shopify.
-      Fill in what each unit takes to make here: it goes into a batch run's cost and shows on the run's page.
-      A run copies these numbers when it's created, so changing them later doesn't change runs already under way.</p>
-    ${shopState === 'failed' ? '<p class="note err">The shop couldn\'t be reached just now, so this is the list as last loaded.</p>' : ''}
-    ${products.length ? '' : `<div class="card"><p class="muted" style="margin:0">${shopState === 'loading' ? 'Loading products from jmwood.work&hellip;' : 'No products found.'}</p></div>`}
-    <div id="productList">${products.map(pr => `<div class="card" data-id="${esc(pr.id)}">
-      <div class="actions" style="margin-bottom:10px"><b>${esc(pr.name)}</b><span class="muted">${pr.variants.length} variant${pr.variants.length === 1 ? '' : 's'}, ${range(pr)}</span></div>
-      <p class="muted" style="margin:0 0 12px;font-size:13px">${pr.variants.map(v => `${esc(v.name)} (${money(v.price)})`).join(' &middot; ')}</p>
-      <div class="grid">
-        <label class="f"><span>Materials cost per unit ($)</span><input data-k="unit_cost" type="number" min="0" step="any" value="${esc(pr.unit_cost)}"></label>
-        <label class="f"><span>Shop hours per unit</span><input data-k="unit_hours" type="number" min="0" step="any" value="${esc(pr.unit_hours)}"></label>
-        <label class="f"><span>Days from order to in the mail</span><input data-k="lead_days" type="number" min="0" step="1" value="${esc(pr.lead_days ?? DEFAULT_LEAD_DAYS)}"></label>
-        <label class="f w6"><span>Materials to buy per unit (shown on the run's page)</span><input data-k="materials" value="${esc(pr.materials)}" placeholder="e.g. 1.5 bf walnut, 2 rubber feet"></label>
-      </div></div>`).join('')}</div>`;
-  $('#productList').addEventListener('input', e => {
-    const k = e.target.dataset.k, pr = s.products.find(x => x.id === e.target.closest('[data-id]')?.dataset.id);
-    if (!k || !pr) return;
-    pr[k] = inputValue(e.target);
-    settingsChanged();
-  });
-}
-
-// ---------- runs fed by Shopify orders ----------
-// With the Shopify app connected, each product with unfulfilled orders has one open batch run that
-// holds everything still owed for it, by variant. New orders add to it, fulfilled or cancelled ones
-// come off, and when nothing is left to make it is marked complete. The next order starts a new run.
-// Each variant keeps what was ordered and what was added or taken off by hand: qty = ordered + extra.
-// The ship-by date is the oldest open order's date plus the product's lead time, unless it was set by hand.
-const DEFAULT_LEAD_DAYS = 14;
-function fromShop(b) { return b.source === 'shopify'; }
-function setVariantQty(b, v, qty) {
-  v.qty = Math.max(0, qty);
-  if (fromShop(b)) v.extra = v.qty - pos(v.ordered);
-}
-const shipByFor = (pr, orders) => {
-  const d = new Date(orders.map(o => o.created_at).sort()[0]);
-  d.setDate(d.getDate() + Math.round(pos(pr.lead_days ?? DEFAULT_LEAD_DAYS)));
-  return ymd(d);
-};
-
-let ordersBusy = false;
-async function loadShopOrders() {
-  if (!store.shopifyConnected || ordersBusy) return;
-  ordersBusy = true;
-  try {
-    const res = await fetch('/api/shop-orders', { cache: 'no-store' });
-    const data = res.ok ? await res.json() : null;
-    if (Array.isArray(data?.orders)) await syncRunsWithOrders(data.orders);
-    else if (data?.error) console.warn(`Shopify orders: ${data.error}`);
-  } catch {}
-  ordersBusy = false;
-}
-
-async function syncRunsWithOrders(orders) {
-  const touched = [];
-  for (const pr of store.settings.products || []) {
-    const mine = orders.map(o => ({ ...o, items: o.items.filter(i => i.handle === pr.handle) })).filter(o => o.items.length);
-    const owed = new Map();
-    for (const o of mine) for (const i of o.items) owed.set(i.variant, (owed.get(i.variant) || 0) + i.qty);
-    let run = store.projects.find(p => isBatch(p) && fromShop(p.data.batch) && p.data.batch.product_id === pr.id && !archived(p));
-    if (!run) {
-      if (!mine.length) continue;
-      run = await createBatch(pr, [...owed].map(([name, qty]) => ({ name, qty, price: pr.variants.find(v => v.name === name)?.price ?? 0 })),
-        shipByFor(pr, mine), { source: 'shopify', quiet: true });
-      if (!run) return;   // the server couldn't be reached: try again next time
-    }
-    const b = run.data.batch, before = JSON.stringify([b, run.data.due_date, run.status]);
-    for (const [name, qty] of owed) {
-      let v = b.variants.find(x => x.name === name);
-      if (!v) b.variants.push(v = { id: `v${Date.now()}${b.variants.length}`, name, price: pr.variants.find(x => x.name === name)?.price ?? 0, extra: 0 });
-      v.ordered = qty;
-    }
-    for (const v of b.variants) {
-      if (!owed.has(v.name)) v.ordered = 0;
-      v.extra ??= 0;
-      v.qty = Math.max(0, pos(v.ordered) + v.extra);
-    }
-    b.variants = b.variants.filter(v => v.qty > 0 || v.ordered > 0);
-    b.orders = mine.map(o => ({ name: o.name, created_at: o.created_at }));
-    // What each order paid for this product, kept after it ships, for the run's profit summary.
-    for (const o of mine) {
-      if (!o.items.some(i => i.amount !== undefined)) continue;   // a list read before amounts were asked for
-      (b.sales ||= {})[o.name] = { at: o.created_at, units: o.items.reduce((n, i) => n + pos(i.quantity ?? i.qty), 0), amount: cents(o.items.reduce((n, i) => n + num(i.amount), 0)) };
-    }
-    if (mine.length && !b.ship_manual) run.data.due_date = shipByFor(pr, mine);
-    if (!b.variants.length) {   // everything has shipped
-      b.variants = [];
-      run.status = 'complete';
-      run.history.push({ status: 'complete', at: new Date().toISOString() });
-      finishTodo(run);
-      if (isFrozen(run)) { delete run.data.frozen; run.history.push({ frozen: false, at: new Date().toISOString() }); }
-    }
-    if (JSON.stringify([b, run.data.due_date, run.status]) === before) continue;
-    run.calc = batchCalc(run.data);
-    run.updated_at = new Date().toISOString();
-    touched.push(run);
-  }
-  if (!touched.length) return;
-  persist();
-  // Show the new numbers on whatever page is open.
-  if (ed?.project && touched.includes(ed.project) && ed.redraw) ed.redraw();
-  else if (!ed && (currentHash === '#/' || currentHash.startsWith('#/s/') || currentHash.startsWith('#/calendar'))) route();
-}
-
 // ---------- receipts: material purchases ----------
-// A photo of a store receipt is sent to the server, which keeps it (the receipts table, for taxes and
-// audits) and reads it (Workers AI, see src/lib/receipts.ts) into line items. They're shown here to
+// A photo of a store receipt is sent to the server, which keeps it (the receipts table, for returns and
+// warranties) and reads it (Workers AI, see src/lib/receipts.ts) into line items. They're shown here to
 // check over: fix a description or price, untick what isn't for this job, pick the project, and the
 // ticked items are added to that project's material purchases
 // (data.purchases: [{ id, date, store, item, qty, amount, receipt }], `receipt` being the receipt's id).
@@ -2803,14 +2017,13 @@ const SCAN_MAX_SIDE = 1600;   // long side of the photo sent to the server, in p
 const PHOTO_MAX_CHARS = 1_400_000;   // what the server will keep (a D1 row); photos are made smaller until they fit
 let scan = null;              // the receipt being checked over: { id, store, date, total, tax, image, kept, lines: [{ description, qty, amount, on, added }] }
 let scanFailed = null;        // a photo that couldn't be read: { id, image, kept, message }
-let scanGeneral = false;      // the ticked items are general business expenses, not for one project
+let scanGeneral = false;      // the ticked items aren't for any one project (tools, general supplies)
 let scanProjectId = null;     // the project picked to add items to
 let purchaseSeq = 0;
 
 const purchasesOf = p => (p.data.purchases ||= []);
 const spentOn = p => cents((p.data.purchases || []).reduce((n, x) => n + num(x.amount), 0));
-// What the project expected to spend on materials: lumber and hardware for a piece, materials for a batch run.
-const budgetFor = p => isBatch(p) ? num(p.calc.materials_est) : num(p.calc.materials_est) + num(p.calc.other_costs);
+const budgetFor = p => pos(p.data.budget);
 // Projects that can take purchases, most recently touched first.
 const purchaseProjects = () => store.projects.filter(p => !archived(p) || p.id === scanProjectId).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 const receiptId = () => `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -2940,14 +2153,14 @@ function renderScan() {
     <button type="button" class="link" data-addline>+ Add ${scan.image ? 'a line that was missed' : 'another line'}</button>
     <hr class="rule">
     ${scan.total && Math.abs(allSum - scan.total) >= 0.01 ? `<p class="note">The lines add up to ${money(allSum)}, but the receipt total reads ${money(scan.total)}. Check for a missed or misread line.</p>` : ''}
-    ${left.length ? `<label class="checkline"><input type="checkbox" id="scanGeneral" ${scanGeneral ? 'checked' : ''}> <span><b>General business expense</b>
-      <small class="muted">not for one project: tools, shop supplies, shipping materials&hellip;</small></span></label>
+    ${left.length ? `<label class="checkline"><input type="checkbox" id="scanGeneral" ${scanGeneral ? 'checked' : ''}> <span><b>Not for a project</b>
+      <small class="muted">tools, shop supplies, things for the house in general&hellip;</small></span></label>
     ${scanGeneral ? '' : `<div class="grid">
       <label class="f w4"><span>Add the ticked items to</span><select id="scanProject">${projects.map(p =>
-        `<option value="${p.id}" ${p.id === scanProjectId ? 'selected' : ''}>${esc(projectName(p))}${isClient(p) ? ` (${esc(p.data.client_name || p.quote_number)})` : ''}</option>`).join('')}</select></label>
+        `<option value="${p.id}" ${p.id === scanProjectId ? 'selected' : ''}>${esc(projectName(p))}</option>`).join('')}</select></label>
     </div>`}
     <div class="actions" style="margin-top:12px">
-      <button type="button" class="btn primary" id="scanAdd" ${picked.length && (scanGeneral || scanProjectId) ? '' : 'disabled'}>Add ${picked.length} item${picked.length === 1 ? '' : 's'} (${money(pickedSum)}) to ${scanGeneral ? 'general business expenses' : 'material costs'}</button>
+      <button type="button" class="btn primary" id="scanAdd" ${picked.length && (scanGeneral || scanProjectId) ? '' : 'disabled'}>Add ${picked.length} item${picked.length === 1 ? '' : 's'} (${money(pickedSum)}) to ${scanGeneral ? 'other purchases' : 'the project'}</button>
     </div>` : `<p class="note ok">Every item on this receipt has been added.</p>`}
     <p style="margin-top:14px"><button type="button" class="link" data-new>Done with this receipt &middot; ${scan.image ? 'scan another' : 'start another'}</button></p>`;
   const sel = $('#scanProject', box);
@@ -3033,7 +2246,7 @@ async function addScanned() {
   filing = true;
   const btn = $('#scanAdd');
   if (btn) { btn.disabled = true; btn.textContent = 'Saving the receipt…'; }
-  // General business expenses are kept with the receipt itself, so they're saved with it.
+  // Lines not for a project are kept with the receipt itself, so they're saved with it.
   const before = r.general || [];
   if (general) r.general = [...before, ...lines.map(l => ({ id: lineId(), item: String(l.description).trim(), qty: l.qty || 1, amount: cents(num(l.amount)) }))];
   try { await fileReceipt(r); }
@@ -3046,8 +2259,8 @@ async function addScanned() {
   }
   filing = false;
   if (general) {
-    for (const l of lines) { l.added = 'general business expenses'; l.on = false; }
-    toast(`Added ${lines.length} item${lines.length === 1 ? '' : 's'} to general business expenses.`);
+    for (const l of lines) { l.added = 'other purchases'; l.on = false; }
+    toast(`Added ${lines.length} item${lines.length === 1 ? '' : 's'} to other purchases.`);
     if (scan === r) renderScan();
     return;
   }
@@ -3059,7 +2272,7 @@ async function addScanned() {
   }
   p.updated_at = new Date().toISOString();
   persist();
-  toast(`Added ${lines.length} item${lines.length === 1 ? '' : 's'} to ${projectName(p)}. Spent on materials so far: ${money(spentOn(p))}`);
+  toast(`Added ${lines.length} item${lines.length === 1 ? '' : 's'} to ${projectName(p)}. Spent so far: ${money(spentOn(p))}${budgetFor(p) ? ` of ${money(budgetFor(p))}` : ''}`);
   if (scan === r) renderScan();
 }
 
@@ -3069,18 +2282,17 @@ function renderPurchasesCard(p) {
   if (!card) return;
   const list = [...(p.data.purchases || [])].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
   const spent = spentOn(p), budget = budgetFor(p);
-  card.innerHTML = `<h2>Material purchases</h2>
+  card.innerHTML = `<h2>Purchases</h2>
     ${list.length ? `<ul class="purchases">${list.map(x => `<li>
       <span>${esc(x.item)}<br><small class="muted">${[x.store, x.date && shortDay(x.date)].filter(Boolean).map(esc).join(' &middot; ')}</small></span>
       <span class="amt">${money(x.amount)}</span>
       <button type="button" class="link" data-unpurchase="${esc(x.id)}" aria-label="Remove ${esc(x.item)}">&times;</button>
     </li>`).join('')}</ul>
     <hr class="rule">
-    <div class="tot"><b>Spent on materials</b><b>${money(spent)}</b></div>
-    ${budget ? `<div class="tot"><span class="muted">Estimated <small>${isBatch(p) ? 'materials' : 'lumber and hardware'}</small></span><span class="muted">${money(budget)}</span></div>
-    <div class="tot"><span class="${spent > budget ? 'over' : 'muted'}">${spent > budget ? 'Over the estimate' : 'Left in the estimate'}</span><span class="${spent > budget ? 'over' : 'muted'}">${money(Math.abs(budget - spent))}</span></div>` : ''}`
+    <div class="tot"><b>Spent so far</b><b>${money(spent)}</b></div>
+    ${budget ? `<div class="tot"><span class="${spent > budget ? 'over' : 'muted'}">${spent > budget ? 'Over budget' : 'Left in the budget'}</span><span class="${spent > budget ? 'over' : 'muted'}">${money(Math.abs(budget - spent))}</span></div>` : ''}`
     : '<p class="muted" style="margin:0 0 10px;font-size:14px">Nothing bought for this project yet.</p>'}
-    <div class="actions" style="margin-top:10px"><a class="btn small" href="#/receipt/${p.id}">Scan a receipt</a><a class="btn small" href="#/p/${p.id}/summary">Profit and receipts</a></div>`;
+    <div class="actions" style="margin-top:10px"><a class="btn small" href="#/receipt/${p.id}">Scan a receipt</a><a class="btn small" href="#/p/${p.id}/summary">Costs and receipts</a></div>`;
 }
 view.addEventListener('click', e => {
   const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-unpurchase]');
@@ -3091,7 +2303,7 @@ view.addEventListener('click', e => {
   p.data.purchases = p.data.purchases.filter(x => x !== item);
   p.updated_at = new Date().toISOString();
   persist();
-  if (ed.redraw && $('#summary')) ed.redraw(); else renderPurchasesCard(p);
+  if (ed.redraw && $('#summary')) ed.redraw(); else { renderPurchasesCard(p); renderPanel(); }
 });
 
 // ---------- every receipt kept ----------
@@ -3256,12 +2468,12 @@ async function showReceiptLog(year) {
   const generalSum = list => sum(list, r => sum(r.general || [], l => l.amount));
   view.innerHTML = `<a href="#/receipt" class="back">&larr; Scan a receipt</a>
     <div class="pagehead"><h1>All receipts</h1></div>
-    <div class="card" id="qbCard"></div>
+    <div class="card" id="exportCard"></div>
     <nav class="tabs"><a href="#/receipts" class="${year ? '' : 'on'}">All</a>${years.map(y => `<a href="#/receipts/${y}" class="${y === year ? 'on' : ''}">${y}</a>`).join('')}</nav>
     <div class="card">
       ${shown.length ? `<div class="tot grand" style="margin-top:0;border-top:0;padding-top:0"><span>${shown.length} receipt${shown.length === 1 ? '' : 's'}${year ? ` in ${year}` : ''}</span><span>${money(sum(shown, r => r.total))}</span></div>
       <div class="tot"><span class="muted">Sales tax paid</span><span class="muted">${money(sum(shown, r => r.tax))}</span></div>
-      ${generalSum(shown) ? `<div class="tot"><span class="muted">General business expenses</span><span class="muted">${money(generalSum(shown))}</span></div>` : ''}
+      ${generalSum(shown) ? `<div class="tot"><span class="muted">Not for a project</span><span class="muted">${money(generalSum(shown))}</span></div>` : ''}
       <ul class="rlog">${shown.map(r => {
         const used = uses.get(r.id) || [];
         return `<li>
@@ -3270,16 +2482,16 @@ async function showReceiptLog(year) {
             ${r.notes ? `<div class="rnote">${esc(r.notes)}</div>` : ''}
             <div class="rprojects">${used.map(u => `<a href="#/p/${u.p.id}/summary">${esc(projectName(u.p))}</a> ${money(sum(u.lines, x => x.amount))}`).join(' &middot; ')}
               ${!used.length && !(r.general || []).length ? `<span class="muted">Not on any project.</span> <button type="button" class="link" data-delreceipt="${esc(r.id)}" style="color:var(--bad)">Delete</button>` : ''}</div>
-            ${(r.general || []).length ? `<div class="rgeneral"><b>General business</b><ul class="purchases">${r.general.map(l => `<li><span>${esc(l.item)}</span><span class="amt">${money(l.amount)}</span>
+            ${(r.general || []).length ? `<div class="rgeneral"><b>Not for a project</b><ul class="purchases">${r.general.map(l => `<li><span>${esc(l.item)}</span><span class="amt">${money(l.amount)}</span>
               <button type="button" class="link" data-ungeneral="${esc(r.id)}:${esc(l.id)}" aria-label="Remove ${esc(l.item)}">&times;</button></li>`).join('')}</ul></div>` : ''}
             ${r.old ? '' : `<button type="button" class="link rnotebtn" data-renote="${esc(r.id)}">${r.notes ? 'Edit notes' : 'Add notes'}</button>`}</div>
           <span class="amt">${money(r.total)}</span>
         </li>`;
       }).join('')}</ul>` : '<p class="muted" style="margin:0">No receipts kept yet. Scan one and its photo is kept here.</p>'}
     </div>
-    <p class="muted" style="font-size:13px">Every receipt photo scanned is kept, even ones with no lines added to a project. Receipts scanned before photos were kept show No photo.</p>`;
-  renderQuickBooksCard();
-  // Notes and general business lines are saved on the receipt itself.
+    <p class="muted" style="font-size:13px">Every receipt photo scanned is kept, even ones with no lines added to a project, for returns and warranties.</p>`;
+  renderExportCard();
+  // Notes and lines not for a project are saved on the receipt itself.
   const resave = async (r, change) => {
     try { await api('/api/receipts', { ...r, ...change }); }
     catch (error) { toast(`Not saved: ${serverSaid(error)}`); return; }
@@ -3294,7 +2506,7 @@ async function showReceiptLog(year) {
   view.querySelectorAll('[data-ungeneral]').forEach(b => b.addEventListener('click', () => {
     const [id, lineId] = b.dataset.ungeneral.split(':');
     const r = log.find(x => x.id === id), line = r?.general.find(l => l.id === lineId);
-    if (!line || !confirm(`Remove ${line.item} (${money(line.amount)}) from general business expenses? The receipt stays on file.`)) return;
+    if (!line || !confirm(`Remove ${line.item} (${money(line.amount)}) from this receipt's other purchases? The receipt stays on file.`)) return;
     resave(r, { general: r.general.filter(l => l !== line) });
   }));
   view.querySelectorAll('[data-delreceipt]').forEach(b => b.addEventListener('click', async () => {
@@ -3306,137 +2518,60 @@ async function showReceiptLog(year) {
   }));
 }
 
-// ---------- Excel export for QuickBooks ----------
-// Everything for a span of dates in one workbook, laid out to match up against QuickBooks Online:
-// each receipt as one expense (its date, vendor and total are what the bank or card feed shows),
-// each line with the customer and project it belongs to, income by project (each Shopify order on its
-// own), and every project's profit and loss as its Summary shows it.
-const EXPENSE_CATEGORY = 'Supplies & Materials';   // a QuickBooks default account; change it in the sheet if you file elsewhere
-const NOT_STARTED = ['draft', 'sent', 'declined'];   // client quotes that never became work
-
+// ---------- Excel export of what's been spent ----------
+// Everything bought in a span of dates, in one workbook: each project's budget and spending, each
+// receipt, and each line with the project it went to.
 const day = iso => String(iso || '').slice(0, 10);
-const customerOf = p => isClient(p) ? (p.data.client_name || 'Client') : isProduct(p) ? 'Shopify' : 'JM Woodwork';
-// A name that stays the same in QuickBooks: a batch run's title changes with its unit count, so it's named by its start date.
-const exportName = p => isBatch(p) ? `${p.data.title} run ${day(p.created_at)}` : projectName(p);
-const customerProject = p => `${customerOf(p)}:${exportName(p)}`;
-const finishedDay = p => archived(p) ? day(finishedAt(p)) : '';
 const $c = (v, s): Cell => (v === '' || v == null ? null : { v, s });
 
-// Income for a project, one row per payment where it's known: [{ date, customer, description, amount, tax }].
-function incomeRows(p) {
-  const rev = revenueOf(p), done = finishedDay(p);
-  if (rev.typed) return [{ date: done, customer: customerOf(p), description: 'Revenue received (typed in on the Summary)', amount: rev.amount, tax: 0 }];
-  if (isBatch(p)) {
-    const sales = Object.entries(p.data.batch.sales || {}) as [string, any][];
-    if (sales.length) return sales.map(([name, x]) => ({ date: day(x.at), customer: 'Shopify', description: `Shopify order ${name}, ${pos(x.units)} × ${p.data.batch.product}`, amount: num(x.amount), tax: 0 }));
-    return num(p.calc.total) ? [{ date: '', customer: 'Shopify', description: 'Retail value of the units (expected; not sold through Shopify yet)', amount: num(p.calc.total), tax: 0 }] : [];
-  }
-  if (!rev.amount) return [];
-  return [{ date: p.status === 'delivered' ? done : '', customer: customerOf(p), amount: rev.amount, tax: num(p.calc.tax),
-    description: `${rev.label}${p.status === 'delivered' ? '' : ' (not delivered yet)'}` }];
-}
-
-async function exportQuickBooks(from, to) {
+async function exportCosts(from, to) {
   const inRange = d => !!d && d >= from && d <= to;
   const uses = receiptUses();
   const log = withOldReceipts([...await loadReceipts()], uses);
   const photo = r => r.has_photo ? { link: `${location.origin}${photoUrl(r.id)}`, text: 'Photo' } : 'No photo';
+  // A project is in the export if something was bought for it in the span, or it was being worked on then.
+  const projects = store.projects.filter(p => (p.data.purchases || []).some(x => inRange(x.date))
+    || (day(p.created_at) <= to && (!archived(p) || day(finishedAt(p)) >= from))).sort((a, b) => a.created_at.localeCompare(b.created_at));
 
-  // A project is in the export if money moved on it in the span, or it was being worked on then.
-  const projects = store.projects.filter(p => {
-    const lines = (p.data.purchases || []).some(x => inRange(x.date));
-    const paid = incomeRows(p).some(r => inRange(r.date));
-    if (lines || paid) return true;
-    if (isClient(p) && NOT_STARTED.includes(p.status)) return false;
-    return day(p.created_at) <= to && (!archived(p) || finishedDay(p) >= from);
-  }).sort((a, b) => a.created_at.localeCompare(b.created_at));
-
-  const head = ['Project', 'Customer:Project', 'Customer', 'Stream', 'Status', 'Started', 'Finished', 'Revenue', 'Revenue basis',
-    'Sales tax collected', 'Materials & supplies', 'Profit', 'Margin', 'State tax set-aside', 'Income tax set-aside', 'Profit after taxes',
-    'Hours worked', 'Profit per hour after taxes', 'Receipts', 'Link'];
-  const summary: Cell[][] = [head];
-  const totals = { rev: 0, tax: 0, spent: 0, profit: 0, stateSet: 0, incomeSet: 0, kept: 0, hours: 0 };
+  const summary: Cell[][] = [['Project', 'Stream', 'Room or area', 'Status', 'Started', 'Finished', 'Budget', 'Spent (all time)', 'Spent in these dates', 'Left in budget', 'Hours worked', 'Link']];
+  const all = { budget: 0, spent: 0, inSpan: 0, hours: 0 };
   for (const p of projects) {
-    const x = pnlOf(p);
-    const salesTax = isClient(p) && !x.rev.typed ? num(p.calc.tax) : 0;
-    summary.push([exportName(p), customerProject(p), customerOf(p), STREAM_NAME[streamOf(p)], STATUS_NAME[p.status] || p.status,
-      $c(day(p.created_at), 'date'), $c(finishedDay(p), 'date'), $c(x.rev.amount, 'money'), [x.rev.label, streamOf(p) === 'gallery' ? '' : x.rev.detail].filter(Boolean).join(', '),
-      $c(salesTax, 'money'), $c(x.spent, 'money'), $c(x.profit, 'money'), x.rev.amount ? $c(x.profit / x.rev.amount, 'pct') : null,
-      $c(x.stateSet, 'money'), $c(x.incomeSet, 'money'), $c(x.kept, 'money'), x.hours ? $c(x.hours, 'hours') : null,
-      x.perHour != null ? $c(cents(x.perHour), 'money') : null, new Set((p.data.purchases || []).map(l => l.receipt || l.id)).size,
-      { link: `${location.origin}/#/p/${p.id}/summary`, text: 'Summary' }]);
-    totals.rev += x.rev.amount; totals.tax += salesTax; totals.spent += x.spent; totals.profit += x.profit;
-    totals.stateSet += x.stateSet; totals.incomeSet += x.incomeSet; totals.kept += x.kept; totals.hours += x.hours;
+    const t = totals(p), inSpan = cents((p.data.purchases || []).filter(x => inRange(x.date)).reduce((n, x) => n + num(x.amount), 0));
+    summary.push([projectName(p), STREAM_NAME[streamOf(p)], p.data.area || '', STATUS_NAME[p.status] || p.status,
+      $c(day(p.created_at), 'date'), $c(archived(p) ? day(finishedAt(p)) : '', 'date'), t.budget ? $c(t.budget, 'money') : null,
+      $c(t.spent, 'money'), $c(inSpan, 'money'), t.budget ? $c(t.left, 'money') : null, t.hours ? $c(t.hours, 'hours') : null,
+      { link: `${location.origin}/#/p/${p.id}/summary`, text: 'Costs' }]);
+    all.budget += t.budget; all.spent += t.spent; all.inSpan += inSpan; all.hours += t.hours;
   }
-  if (projects.length) summary.push([{ v: 'Total', s: 'bold' }, null, null, null, null, null, null, $c(cents(totals.rev), 'boldmoney'), null,
-    $c(cents(totals.tax), 'boldmoney'), $c(cents(totals.spent), 'boldmoney'), $c(cents(totals.profit), 'boldmoney'), null,
-    $c(cents(totals.stateSet), 'boldmoney'), $c(cents(totals.incomeSet), 'boldmoney'), $c(cents(totals.kept), 'boldmoney'), totals.hours ? $c(totals.hours, 'hours') : null]);
+  if (projects.length) summary.push([{ v: 'Total', s: 'bold' }, null, null, null, null, null, $c(cents(all.budget), 'boldmoney'),
+    $c(cents(all.spent), 'boldmoney'), $c(cents(all.inSpan), 'boldmoney'), null, all.hours ? $c(all.hours, 'hours') : null]);
 
-  // One row per receipt: what to match against the bank or card transaction.
-  const receipts: Cell[][] = [['Date', 'Vendor', 'Total', 'Sales tax', 'Category', 'Customer:Project', 'Memo', 'Notes', 'General business', 'Receipt ID', 'Photo']];
+  const receipts: Cell[][] = [['Date', 'Store', 'Total', 'Sales tax', 'Project', 'Items', 'Notes', 'Photo']];
   for (const r of [...log].reverse().filter(r => inRange(r.date))) {
-    const used = uses.get(r.id) || [];
-    const general = r.general || [];
+    const used = uses.get(r.id) || [], general = r.general || [];
     const items = [...used.flatMap(u => u.lines.map(l => l.item)), ...general.map(l => l.item)].filter(i => !/^sales tax$/i.test(i));
-    const where = used.length + (general.length ? 1 : 0) > 1 ? 'Split: see Expense lines'
-      : used.length ? customerProject(used[0].p) : general.length ? 'General business' : 'Not on a project';
-    receipts.push([$c(r.date, 'date'), r.store, $c(r.total, 'money'), $c(r.tax, 'money'), EXPENSE_CATEGORY, where,
-      items.join('; ').slice(0, 1000), r.notes || '', general.length ? $c(cents(general.reduce((n, l) => n + num(l.amount), 0)), 'money') : null, r.id, photo(r)]);
+    const where = used.length + (general.length ? 1 : 0) > 1 ? 'Split: see Lines' : used.length ? projectName(used[0].p) : general.length ? 'Not for a project' : '';
+    receipts.push([$c(r.date, 'date'), r.store, $c(r.total, 'money'), $c(r.tax, 'money'), where, items.join('; ').slice(0, 1000), r.notes || '', photo(r)]);
   }
 
-  // One row per line, with the project it's billed to: for splitting a receipt across projects in QuickBooks.
   const known = new Map(log.map(r => [r.id, r]));
-  const lines: Cell[][] = [['Date', 'Vendor', 'Description', 'Amount', 'Category', 'Customer:Project', 'Customer', 'Project', 'Class', 'Receipt notes', 'Receipt ID', 'Photo']];
+  const lines: Cell[][] = [['Date', 'Store', 'Item', 'Amount', 'Project', 'Stream', 'Receipt notes', 'Photo']];
   const allLines = [
     ...store.projects.flatMap(p => (p.data.purchases || []).filter(x => inRange(x.date)).map(x => ({ p, x }))),
     ...log.filter(r => inRange(r.date)).flatMap(r => (r.general || []).map(l => ({ p: null, x: { ...l, date: r.date, store: r.store, receipt: r.id } }))),
   ].sort((a, b) => a.x.date.localeCompare(b.x.date) || String(a.x.receipt).localeCompare(String(b.x.receipt)));
   for (const { p, x } of allLines) {
     const r = known.get(x.receipt);
-    lines.push([$c(x.date, 'date'), x.store, x.item, $c(num(x.amount), 'money'), EXPENSE_CATEGORY,
-      p ? customerProject(p) : '', p ? customerOf(p) : '', p ? exportName(p) : '', p ? STREAM_NAME[streamOf(p)] : 'General business',
-      r?.notes || '', x.receipt || 'Typed in', r ? photo(r) : 'No photo']);
+    lines.push([$c(x.date, 'date'), x.store, x.item, $c(num(x.amount), 'money'), p ? projectName(p) : 'Not for a project',
+      p ? STREAM_NAME[streamOf(p)] : '', r?.notes || '', r ? photo(r) : 'Typed in']);
   }
-
-  // Income: dated payments in the span, and what's still expected on the projects listed.
-  const income: Cell[][] = [['Date', 'Customer', 'Customer:Project', 'Project', 'Description', 'Amount before sales tax', 'Sales tax', 'Total', 'Class']];
-  for (const p of projects) for (const r of incomeRows(p)) {
-    if (r.date && !inRange(r.date)) continue;
-    income.push([r.date ? $c(r.date, 'date') : 'Not received yet', r.customer, customerProject(p), exportName(p), r.description,
-      $c(r.amount, 'money'), $c(r.tax, 'money'), $c(cents(r.amount + r.tax), 'money'), STREAM_NAME[streamOf(p)]]);
-  }
-
-  const about: Cell[][] = [
-    [{ v: `${store.settings.business_name || 'Shop Tracker'}: export for QuickBooks`, s: 'bold' }],
-    [`Dates ${from} to ${to}, made ${ymd(new Date())}.`],
-    [],
-    [{ v: 'Project summary', s: 'bold' }],
-    ['Every project worked on or paid in these dates, with its whole profit and loss as its Summary page shows it (not only the part in these dates).'],
-    ['Revenue is the agreed or quoted price before sales tax, a product run\'s Shopify orders, or the figure typed in on the Summary.'],
-    [`Tax set-asides are estimates: the project's state tax rate plus ${+pos(store.settings.income_tax_pct)}% income tax, taken from profit.`],
-    [],
-    [{ v: 'Expenses by receipt', s: 'bold' }],
-    ['One row per receipt dated in the span. Date, vendor and total match the bank or card transaction to categorize in QuickBooks.'],
-    [`Category is "${EXPENSE_CATEGORY}" for every row; change it where a purchase belongs in another account.`],
-    [],
-    [{ v: 'Expense lines', s: 'bold' }],
-    ['Each line of each receipt with the customer and project it went to, for splitting a transaction across projects.'],
-    ['General business expenses (not for one project) have no customer or project, and "General business" as their class.'],
-    [],
-    [{ v: 'Income', s: 'bold' }],
-    ['Payments dated in the span (a client job on the day it was marked delivered, each Shopify order on its order date), then amounts still expected on the projects listed.'],
-    [],
-    ['Photo and Summary links open in Shop Tracker, so sign in there first.'],
-  ];
 
   const sheets: Sheet[] = [
-    { name: 'Project summary', rows: summary, widths: [28, 40, 20, 14, 14, 11, 11, 13, 34, 12, 14, 13, 8, 12, 12, 13, 9, 13, 9, 10] },
-    { name: 'Expenses by receipt', rows: receipts, widths: [11, 28, 12, 11, 20, 40, 60, 50, 14, 16, 10] },
-    { name: 'Expense lines', rows: lines, widths: [11, 28, 44, 12, 20, 40, 20, 28, 16, 50, 16, 10] },
-    { name: 'Income', rows: income, widths: [14, 20, 40, 28, 52, 14, 11, 13, 14] },
-    { name: 'About', rows: about, widths: [140], header: false },
+    { name: 'Projects', rows: summary, widths: [30, 18, 18, 12, 11, 11, 12, 14, 14, 13, 10, 10] },
+    { name: 'Receipts', rows: receipts, widths: [11, 28, 12, 11, 30, 60, 50, 10] },
+    { name: 'Lines', rows: lines, widths: [11, 28, 44, 12, 30, 18, 50, 10] },
   ];
-  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(workbook(sheets)), download: `shop-tracker-quickbooks-${from}-to-${to}.xlsx` });
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(workbook(sheets)), download: `home-projects-costs-${from}-to-${to}.xlsx` });
   document.body.append(a);
   a.click();
   a.remove();
@@ -3445,88 +2580,55 @@ async function exportQuickBooks(from, to) {
 }
 
 // The export's card on the All receipts page: a span of dates, with quick picks for this year and last.
-let qbFrom = '', qbTo = '';
-function renderQuickBooksCard() {
-  const card = $('#qbCard');
+let exFrom = '', exTo = '';
+function renderExportCard() {
+  const card = $('#exportCard');
   if (!card) return;
   const now = new Date(), y = now.getFullYear();
-  qbFrom ||= `${y}-01-01`;
-  qbTo ||= ymd(now);
-  card.innerHTML = `<h2>Export for QuickBooks</h2>
-    <p class="muted" style="margin:0 0 10px;font-size:14px">An Excel file with every project's summary, each receipt and its lines with the customer and project they belong to, and income, for the dates you pick.</p>
+  exFrom ||= `${y}-01-01`;
+  exTo ||= ymd(now);
+  card.innerHTML = `<h2>Download spending as Excel</h2>
+    <p class="muted" style="margin:0 0 10px;font-size:14px">Each project's budget and spending, every receipt, and every line with the project it went to, for the dates you pick.</p>
     <div class="qbrange">
-      <label class="f"><span>From</span><input type="date" id="qbFrom" value="${esc(qbFrom)}"></label>
-      <label class="f"><span>To</span><input type="date" id="qbTo" value="${esc(qbTo)}"></label>
+      <label class="f"><span>From</span><input type="date" id="exFrom" value="${esc(exFrom)}"></label>
+      <label class="f"><span>To</span><input type="date" id="exTo" value="${esc(exTo)}"></label>
     </div>
     <p style="margin:8px 0 0;font-size:13px"><button type="button" class="link" data-span="${y}">This year</button> &middot;
-      <button type="button" class="link" data-span="${y - 1}">Last year</button> &middot;
-      <button type="button" class="link" data-span="q">This quarter</button></p>
-    <div class="actions" style="margin-top:12px"><button type="button" class="btn primary" id="qbGo">Download Excel file</button><span class="muted" id="qbSaid" style="font-size:13px"></span></div>`;
+      <button type="button" class="link" data-span="${y - 1}">Last year</button></p>
+    <div class="actions" style="margin-top:12px"><button type="button" class="btn primary" id="exGo">Download Excel file</button><span class="muted" id="exSaid" style="font-size:13px"></span></div>`;
   card.addEventListener('change', e => {
     const el = e.target as HTMLInputElement;
-    if (el.id === 'qbFrom') qbFrom = el.value; else if (el.id === 'qbTo') qbTo = el.value;
+    if (el.id === 'exFrom') exFrom = el.value; else if (el.id === 'exTo') exTo = el.value;
   });
   card.addEventListener('click', async e => {
     const btn = (e.target as HTMLElement).closest('button');
     if (!btn) return;
     if (btn.dataset.span) {
-      const span = btn.dataset.span;
-      if (span === 'q') { const q = Math.floor(now.getMonth() / 3) * 3; qbFrom = ymd(new Date(y, q, 1)); qbTo = ymd(new Date(y, q + 3, 0)); }
-      else { qbFrom = `${span}-01-01`; qbTo = `${span}-12-31`; }
-      ($('#qbFrom') as HTMLInputElement).value = qbFrom;
-      ($('#qbTo') as HTMLInputElement).value = qbTo;
+      exFrom = `${btn.dataset.span}-01-01`; exTo = `${btn.dataset.span}-12-31`;
+      ($('#exFrom') as HTMLInputElement).value = exFrom;
+      ($('#exTo') as HTMLInputElement).value = exTo;
       return;
     }
-    if (btn.id !== 'qbGo') return;
-    const said = $('#qbSaid');
-    if (!qbFrom || !qbTo || qbFrom > qbTo) { said.textContent = 'Pick a From date on or before the To date.'; return; }
+    if (btn.id !== 'exGo') return;
+    const said = $('#exSaid');
+    if (!exFrom || !exTo || exFrom > exTo) { said.textContent = 'Pick a From date on or before the To date.'; return; }
     btn.disabled = true;
     said.textContent = 'Making the file…';
     try {
-      const n = await exportQuickBooks(qbFrom, qbTo);
+      const n = await exportCosts(exFrom, exTo);
       said.textContent = `Downloaded: ${n.projects} project${n.projects === 1 ? '' : 's'}, ${n.receipts} receipt${n.receipts === 1 ? '' : 's'}.`;
     } catch (error) { said.textContent = `Couldn't make the file: ${serverSaid(error)}`; }
     btn.disabled = false;
   });
 }
 
-// ---------- project summary: receipts and profit ----------
-// Revenue against what was spent, the hours put in (typed in: data.hours_worked) and what that comes
-// to per hour. Revenue is worked out from the project unless a figure is typed in (data.revenue_actual):
-// a client job's agreed (or quoted) price before sales tax, or a product run's Shopify sales
-// (data.batch.sales, kept from its orders) or else the retail value of its units.
-function revenueOf(p) {
-  const typed = p.data.revenue_actual;
-  if (typed !== '' && typed != null) return { amount: pos(typed), label: 'Revenue received', typed: true };
-  if (isBatch(p)) {
-    const sales = Object.entries(p.data.batch.sales || {}) as [string, any][];
-    if (sales.length) return { amount: cents(sales.reduce((n, [, s]) => n + num(s.amount), 0)), label: `Shopify orders`, detail: sales.map(([name]) => name).join(', ') };
-    return { amount: num(p.calc.total), label: 'Retail value of the units', detail: 'expected, not yet sold through Shopify' };
-  }
-  if (streamOf(p) === 'gallery') return { amount: 0, label: 'Not for sale', detail: 'type in a price below if it sells' };
-  return { amount: num(p.calc.subtotal), label: p.calc.agreed ? 'Agreed price' : 'Quoted price', detail: num(p.calc.tax) ? 'before sales tax' : '' };
-}
-
-// The project's profit and loss, as its Summary shows it (and the QuickBooks export lists it).
-function pnlOf(p) {
-  const rev = revenueOf(p), spent = spentOn(p), profit = cents(rev.amount - spent);
-  const hours = pos(p.data.hours_worked), rate = pos(p.data.rates?.hourly_rate ?? store.settings.hourly_rate);
-  // Set aside from profit: the project's state rate (the one picked on its Details, or the no-state default
-  // for work without a state) plus the income tax share from the settings.
-  const state = isClient(p) ? p.data.client_state : '';
-  const statePct = state ? pos(p.data.rates?.tax_pct) : pos(store.settings.tax_pct);
-  const incomePct = pos(store.settings.income_tax_pct), taxPct = statePct + incomePct;
-  const base = Math.max(profit, 0);
-  const stateSet = cents(base * statePct / 100), incomeSet = cents(base * incomePct / 100);
-  const setAside = cents(stateSet + incomeSet), kept = cents(profit - setAside);
-  const perHour = hours ? kept / hours : null;
-  return { rev, spent, profit, hours, rate, state, statePct, incomePct, taxPct, stateSet, incomeSet, setAside, kept, perHour };
-}
-
+// ---------- project costs: budget against what was spent ----------
+// What the project has cost so far against its budget, receipt by receipt, and the hours put in (typed
+// in: data.hours_worked).
 function showSummary(p) {
   ed = { project: p, stream: streamOf(p), data: p.data, dirty: false };
   view.innerHTML = `${projectHeader(p, 'summary', '<button class="btn small" onclick="window.print()">Print / save as PDF</button>')}
-    <div class="printhead"><h1>${esc(projectName(p))}</h1><div class="muted">${isClient(p) ? `${esc(p.quote_number)} &middot; ${esc(p.data.client_name || '')} &middot; ` : ''}${STREAM_NAME[streamOf(p)]} &middot; Summary as of ${esc(fmtDate(new Date().toISOString()))}</div></div>
+    <div class="printhead"><h1>${esc(projectName(p))}</h1><div class="muted">${STREAM_NAME[streamOf(p)]}${p.data.area ? ` &middot; ${esc(p.data.area)}` : ''} &middot; Costs as of ${esc(fmtDate(new Date().toISOString()))}</div></div>
     <div class="cols" id="summary">
       <div><div class="card" id="pnl"></div></div>
       <aside><div class="card" id="receiptsCard"></div></aside>
@@ -3534,35 +2636,32 @@ function showSummary(p) {
   const touch = () => { p.updated_at = new Date().toISOString(); persist(); };
   const pnl = $('#pnl');
   const renderPnl = () => {
-    const { rev, spent, profit, hours, rate, state, statePct, incomePct, taxPct, stateSet, incomeSet, kept, perHour } = pnlOf(p);
-    const receipts = new Set((p.data.purchases || []).map(x => x.receipt || x.id)).size;
-    const estHours = num(p.calc.labor_hours) + num(p.calc.contingency_hours);
-    pnl.innerHTML = `<h2>Profit and loss</h2>
-      <div class="pl-sec">Revenue</div>
-      <div class="tot"><span>${esc(rev.label)}${rev.detail ? ` <small>${esc(rev.detail)}</small>` : ''}</span><b>${money(rev.amount)}</b></div>
-      ${isClient(p) && num(p.calc.tax) && !rev.typed ? `<div class="tot"><span class="muted">Sales tax collected <small>passed on to the state, not counted</small></span><span class="muted">${money(p.calc.tax)}</span></div>` : ''}
-      <div class="pl-sec">Expenses</div>
-      <div class="tot"><span>Materials and supplies <small>${(p.data.purchases || []).length} line${(p.data.purchases || []).length === 1 ? '' : 's'} from ${receipts} receipt${receipts === 1 ? '' : 's'}, tax included</small></span><b>&minus; ${money(spent)}</b></div>
-      <div class="tot grand ${profit < 0 ? 'loss' : 'profit'}"><span>${profit < 0 ? 'Loss' : 'Profit'}</span><span>${money(Math.abs(profit))}</span></div>
-      ${rev.amount ? `<div class="tot"><span class="muted">Margin</span><span class="muted">${Math.round(profit / rev.amount * 100)}%</span></div>` : ''}
-      ${taxPct ? `<div class="pl-sec">Set aside for taxes <small style="text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted)">estimates, ${+cents(taxPct)}% of profit</small></div>
-        ${statePct ? `<div class="tot"><span>State tax <small>${state ? `${esc(STATE_NAME[state] || state)} ` : ''}${+statePct}%</small></span><b>&minus; ${money(stateSet)}</b></div>` : ''}
-        ${incomePct ? `<div class="tot"><span>Income tax <small>${+incomePct}%</small></span><b>&minus; ${money(incomeSet)}</b></div>` : ''}
-        <div class="tot grand aftertax ${kept < 0 ? 'loss' : 'profit'}"><span>Profit after taxes</span><span>${money(kept)}</span></div>` : ''}
+    const t = totals(p);
+    p.calc = t;
+    const receipts = new Set((p.data.purchases || []).map(x => x.receipt || x.id)).size, lines = (p.data.purchases || []).length;
+    // Spending by month, so a long project shows where the money went when.
+    const months = new Map();
+    for (const x of p.data.purchases || []) { const m = (x.date || '').slice(0, 7) || 'No date'; months.set(m, (months.get(m) || 0) + num(x.amount)); }
+    const monthRows = [...months].sort((a, b) => a[0].localeCompare(b[0]));
+    pnl.innerHTML = `<h2>Budget and spending</h2>
+      <div class="tot"><span>Spent so far <small>${lines} item${lines === 1 ? '' : 's'} from ${receipts} receipt${receipts === 1 ? '' : 's'}, tax included</small></span><b>${money(t.spent)}</b></div>
+      ${t.budget ? `<div class="tot"><span class="muted">Budget</span><span class="muted">${money(t.budget)}</span></div>
+        <div class="meter ${t.spent > t.budget ? 'over' : ''}" aria-hidden="true"><span style="width:${Math.min(100, Math.round(t.spent / t.budget * 100))}%"></span></div>
+        <div class="tot grand ${t.spent > t.budget ? 'loss' : 'profit'}"><span>${t.spent > t.budget ? 'Over budget' : 'Left to spend'}</span><span>${money(Math.abs(t.left))}</span></div>
+        <div class="tot"><span class="muted">Used</span><span class="muted">${Math.round(t.spent / t.budget * 100)}%</span></div>` : ''}
+      ${monthRows.length > 1 ? `<div class="pl-sec">By month</div>${monthRows.map(([m, n]) => `<div class="tot"><span>${m === 'No date' ? m : esc(new Date(m + '-01T00:00').toLocaleDateString(undefined, { month: 'long', year: 'numeric' }))}</span><span>${money(n)}</span></div>`).join('')}` : ''}
       <div class="pl-sec">Time</div>
-      <div class="tot"><span>Hours worked</span><b>${hours ? hrs(hours) : '<span class="muted">not entered</span>'}</b></div>
-      ${perHour != null ? `<div class="tot grand perhour ${perHour < rate ? 'under' : ''}"><span>Profit per hour${taxPct ? ' <small>after taxes</small>' : ''}</span><span>${money(perHour)}</span></div>
-        <div class="tot"><span class="muted">Your hourly rate on this project</span><span class="muted">${money(rate)}</span></div>` : ''}
+      <div class="tot"><span>Hours worked</span><b>${t.hours ? hrs(t.hours) : '<span class="muted">not entered</span>'}</b></div>
       <hr class="rule">
       <div class="grid noprint">
-        <label class="f w3"><span>Total hours worked</span><input type="number" min="0" step="0.25" inputmode="decimal" id="hoursWorked" value="${esc(p.data.hours_worked ?? '')}" placeholder="${estHours ? `estimate ${+estHours.toFixed(2)}` : 'e.g. 12.5'}"></label>
-        <label class="f w3"><span>Revenue received ($) <small>leave blank to use the ${esc(revenueOf({ ...p, data: { ...p.data, revenue_actual: '' } }).label.replace(/^(?!Shopify)./, c => c.toLowerCase()))}</small></span><input type="number" min="0" step="0.01" inputmode="decimal" id="revenueActual" value="${esc(p.data.revenue_actual ?? '')}"></label>
+        <label class="f w3"><span>Budget ($)</span><input type="number" min="0" step="any" inputmode="decimal" id="budget" value="${esc(p.data.budget ?? '')}" placeholder="No budget set"></label>
+        <label class="f w3"><span>Total hours worked</span><input type="number" min="0" step="0.25" inputmode="decimal" id="hoursWorked" value="${esc(p.data.hours_worked ?? '')}" placeholder="e.g. 12.5"></label>
       </div>`;
   };
   pnl.addEventListener('change', e => {
     const el = e.target as HTMLInputElement;
     if (el.id === 'hoursWorked') p.data.hours_worked = el.value === '' ? '' : pos(el.value);
-    else if (el.id === 'revenueActual') p.data.revenue_actual = el.value === '' ? '' : cents(pos(el.value));
+    else if (el.id === 'budget') p.data.budget = el.value === '' ? '' : cents(pos(el.value));
     else return;
     touch();
     renderPnl();
@@ -3595,7 +2694,7 @@ function showSummary(p) {
       }).join('')}</ul>
       <div class="tot grand"><span>Total spent</span><span>${money(spentOn(p))}</span></div>`
       : '<p class="muted" style="margin:0 0 10px;font-size:14px">No receipts on this project yet.</p>'}
-      <div class="actions noprint" style="margin-top:10px"><a class="btn small primary" href="#/receipt/${p.id}">Scan a receipt</a><a class="btn small" href="#/receipts">All receipts &middot; Excel export</a></div>`;
+      <div class="actions noprint" style="margin-top:10px"><a class="btn small primary" href="#/receipt/${p.id}">Scan a receipt</a><a class="btn small" href="#/receipts">All receipts</a></div>`;
   };
   ed.redraw = () => { renderPnl(); renderReceipts(); };
   ed.redraw();
@@ -3603,8 +2702,8 @@ function showSummary(p) {
   loadReceipts().then(() => { if (ed?.project === p && $('#summary')) renderReceipts(); }).catch(() => {});
 }
 
-// ---------- design notes (internal; never shown on the client quote) ----------
-const NOTE_KINDS = ['Client call', 'Site visit', 'Email or message', 'Research', 'Other'];
+// ---------- design notes ----------
+const NOTE_KINDS = ['Idea', 'Measurements', 'Store visit', 'Contractor or quote', 'Research', 'Other'];
 
 // Web addresses typed into a note, as links that open in a new tab.
 const linksHtml = text => (String(text).match(/https?:\/\/[^\s<>"]+/g) || [])
@@ -3621,13 +2720,13 @@ function showDesign(p) {
       ${projectHeader(p, 'design', '<span class="muted">Changes save automatically</span>')}
       <div class="design">
         <div class="card"><h2>Design brief</h2>
-          <textarea class="brief" id="brief" placeholder="The current picture of what the client wants: how the piece will be used, style and references, the space it's going into, must-haves, budget and timing.">${esc(design.brief)}</textarea>
+          <textarea class="brief" id="brief" placeholder="The current picture of what you want: how it will be used, the look and inspiration, the space it's going into, must-haves, budget and timing.">${esc(design.brief)}</textarea>
           <div class="links" id="briefLinks">${linksHtml(design.brief)}</div>
         </div>
         <div class="card" id="entries">
-          <div class="actions"><h2 style="margin:0">Calls &amp; due diligence</h2><span class="spacer" style="flex:1"></span>
+          <div class="actions"><h2 style="margin:0">Ideas &amp; research</h2><span class="spacer" style="flex:1"></span>
             <button class="btn primary small" data-act="add">+ Add note</button></div>
-          ${order.length ? '' : '<p class="muted" style="margin:12px 0 0">No notes yet. Add one after each client call, site visit or piece of research.</p>'}
+          ${order.length ? '' : '<p class="muted" style="margin:12px 0 0">No notes yet. Add ideas, measurements, quotes and links as you go.</p>'}
           <div style="margin-top:12px">${order.map(i => `<div class="entry">
             <div class="actions">
               <input type="date" data-i="${i}" data-k="date" value="${esc(design.notes[i].date)}" aria-label="Date">
@@ -3695,7 +2794,7 @@ const cutOrder = (a, b) => (b.l ? 1 : 0) - (a.l ? 1 : 0) || (b.t || 0) - (a.t ||
 
 function wireCutList(p) {
   const list = () => (p.data.cutlist ??= { items: [], source: null });
-  const species = p.data.spec?.species || '';
+  const species = p.data.species || '';
   const touch = () => { p.updated_at = new Date().toISOString(); persist(); };
   const tabCount = () => { const tab = $('.projtabs a.on'); if (tab) tab.innerHTML = `Cut list${cutsLeft(p) ? ` <small title="pieces left to cut">${cutsLeft(p)}</small>` : ''}`; };
   const toItem = (x: Piece) => ({ id: newTask('').id, part: x.part, qty: x.qty || 1, t: x.t, w: x.w, l: x.l, species: x.species || '', done_at: null });
@@ -3869,45 +2968,6 @@ function wireCutList(p) {
   draw();
 }
 
-// ---------- client-facing quote ----------
-function showQuote(p) {
-  const { data: d, calc } = p, s = store.settings, spec = d.spec;
-  const validUntil = new Date(p.created_at);
-  validUntil.setDate(validUntil.getDate() + pos(s.quote_valid_days));
-  const dims = [spec.length, spec.width, spec.height].map(v => +pos(v));
-  const extras = [['drawers', 'drawer'], ['doors', 'door'], ['shelves', 'shelf', 'shelves']]
-    .filter(([k]) => pos(spec[k]) > 0).map(([k, one, many]) => `${spec[k]} ${spec[k] === 1 ? one : many || one + 's'}`).join(', ');
-  view.innerHTML = `
-    ${projectHeader(p, 'quote', '<button class="btn primary small" onclick="window.print()">Print / save as PDF</button>')}
-    <article class="card quote">
-      <div class="qhead">
-        <div><h1>${esc(s.business_name || 'Quote')}</h1><div class="muted pre">${esc(s.business_contact)}</div></div>
-        <div style="text-align:right"><b>Quote ${esc(p.quote_number)}</b><br>${esc(fmtDate(p.created_at))}<br>
-          <span class="muted">Valid until ${esc(fmtDate(validUntil.toISOString()))}</span></div>
-      </div>
-      <dl>
-        <dt>Prepared for</dt><dd>${esc(d.client_name || '-')}${d.client_email ? `<br>${esc(d.client_email)}` : ''}${d.client_phone ? `<br>${esc(d.client_phone)}` : ''}</dd>
-        <dt>Project</dt><dd><b>${esc(projectName(p))}</b></dd>
-        <dt>Wood</dt><dd>${esc(spec.species || '-')}</dd>
-        <dt>Dimensions</dt><dd>${dims[0]}" L &times; ${dims[1]}" W &times; ${dims[2]}" H</dd>
-        <dt>Finish</dt><dd>${esc(FINISHES[spec.finish].name)}</dd>
-        ${extras ? `<dt>Includes</dt><dd>${esc(extras)}</dd>` : ''}
-        ${d.due_date ? `<dt>Est. completion</dt><dd>${esc(fmtDate(d.due_date))}</dd>` : ''}
-      </dl>
-      ${spec.description ? `<p class="pre">${esc(spec.description)}</p>` : ''}
-      <table>
-        <tr><td>${esc(projectName(p))}<br><span class="muted">Design, materials and craftsmanship</span></td><td>${money(calc.subtotal)}</td></tr>
-        ${calc.tax ? `<tr><td>${esc(STATE_NAME[d.client_state] || '')} sales tax (${+pos(d.rates.tax_pct)}%)</td><td>${money(calc.tax)}</td></tr>` : ''}
-        <tr class="grand"><td>Total</td><td>${money(calc.total)}</td></tr>
-        ${calc.retainer ? `<tr><td>Less design retainer paid</td><td>&minus; ${money(calc.retainer)}</td></tr>
-        <tr><td><b>Balance due</b></td><td><b>${money(calc.balance)}</b></td></tr>` : ''}
-        ${calc.deposit ? `<tr><td class="muted">Deposit to begin (${+pos(d.rates.deposit_pct)}%${calc.retainer ? ' of balance' : ''})</td><td>${money(calc.deposit)}</td></tr>` : ''}
-      </table>
-      <p class="muted">Material costs are contingent upon lumber availability and may vary.</p>
-      <p class="muted pre">${esc(s.quote_terms)}</p>
-    </article>`;
-}
-
 // ---------- settings ----------
 function showSettings() {
   const s = store.settings;
@@ -3916,40 +2976,14 @@ function showSettings() {
   view.innerHTML = `
     <div class="pagehead"><h1>Settings</h1><span class="spacer"></span><span class="muted">Changes save automatically</span></div>
     <div class="card" id="general">
-      <fieldset><h2>Your business (shown on quotes)</h2><div class="grid">
-        ${inp('Business name', 'business_name', 'text', 'w3')}
-        <label class="f w3"><span>Contact details</span><textarea data-path="business_contact" placeholder="Address, phone, email">${esc(s.business_contact)}</textarea></label>
-        <label class="f w6"><span>Quote terms</span><textarea data-path="quote_terms">${esc(s.quote_terms)}</textarea></label>
-      </div></fieldset>
-      <fieldset><h2>Defaults for new quotes</h2><div class="grid">
-        ${inp('Hourly rate ($)', 'hourly_rate', 'number')}${inp('Design retainer ($)', 'design_retainer', 'number')}${inp('Contingency (%)', 'contingency_pct', 'number')}${inp('Materials markup (%)', 'markup_pct', 'number')}
-        ${inp('Sales tax when no state is set (%)', 'tax_pct', 'number')}${inp('Deposit (%)', 'deposit_pct', 'number')}${inp('Quote valid for (days)', 'quote_valid_days', 'number')}
-      </div></fieldset>
-      <fieldset><h2>Estimating</h2><div class="grid">
-        ${inp('Shop speed multiplier', 'shop_speed', 'number', 'w3')}${inp('Lumber waste allowance (%)', 'waste_pct', 'number', 'w3')}
-      </div><p class="muted" style="margin-bottom:0">Shop speed scales every estimated hour: if jobs take you about 20% longer than estimated, set it to 1.2.</p></fieldset>
-      <fieldset><h2>Project summaries</h2><div class="grid">
-        ${inp('Income tax to set aside (% of profit)', 'income_tax_pct', 'number', 'w3')}
-      </div><p class="muted" style="margin-bottom:0">Each project's Summary sets aside this share of its profit for income tax, plus its state's rate (the state picked on a client job, or the no-state sales tax rate above for other work).</p></fieldset>
-    </div>
-    <div class="card"><h2>Sales tax by state</h2>
-      <p class="muted" style="margin-top:0">Choosing a client's state on a quote applies the rate below. These are statewide rates only, without city or county taxes, so check them against current rates before relying on them.</p>
-      <details><summary class="link" style="display:inline-block">Show and edit state rates</summary>
-        <div class="grid" id="stateTax" style="grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); margin-top:12px">
-          ${STATES.map(([code, name]) => `<label class="f" style="grid-column:auto"><span>${name}</span><input type="number" min="0" step="any" data-state="${code}" value="${esc(s.state_tax[code] ?? 0)}"></label>`).join('')}
-        </div>
-      </details>
+      <fieldset><h2>Lumber</h2><div class="grid">
+        ${inp('Waste allowance (%)', 'waste_pct', 'number', 'w3')}
+      </div><p class="muted" style="margin-bottom:0">Added on top of a cut list's board feet when working out how much lumber to buy, for knots, checks and offcuts.</p></fieldset>
     </div>
     <div class="card"><h2>Wood species</h2>
-      <p class="muted" style="margin-top:0" id="feedInfo"></p>
+      <p class="muted" style="margin-top:0">The woods a shop build can be made of, with a rough price per board foot from where you buy lumber, for the lumber cost on a project.</p>
       <div style="overflow-x:auto"><table class="list" id="species"></table></div>
       <p><button class="link" id="addSpecies">+ Add species</button></p>
-      <p class="muted" style="margin-bottom:0">Labor factor: 1.0 is cherry or walnut. Harder, tear-out-prone woods are above 1, softwoods below.</p>
-    </div>
-    <div class="card"><h2>Product line</h2>
-      <p class="muted" style="margin-top:0">${(s.products || []).length} product${(s.products || []).length === 1 ? '' : 's'} from jmwood.work, for quick batch runs on the Product line tab.
-        ${store.shopifyConnected ? 'Shopify is connected: unfulfilled orders keep each product\'s run up to date.' : 'Connect the Shopify app (the <code>SHOPIFY_CLIENT_ID</code> and <code>SHOPIFY_CLIENT_SECRET</code> secrets, see DEPLOYMENT.md) to build runs from unfulfilled orders.'}</p>
-      <a class="btn" href="#/products">Edit products</a>
     </div>
     <div class="card"><h2>Backup</h2>
       <p class="muted">Projects and settings are stored on the server and shared by every device you sign in on. Export a backup now and then to keep a copy of your own.</p>
@@ -3968,43 +3002,18 @@ function showSettings() {
   });
 
   const speciesTable = $('#species');
-  const itemLabel = i => `${i.species} \u00b7 ${i.size}${i.wide ? ` \u00b7 ${i.wide}` : ''}${i.spec ? ` \u00b7 ${i.spec}` : ''} \u2013 $${i.price.toFixed(2)}`;
-  const itemOptions = (list, selected) => feed.items.filter(i => i.list === list)
-    .map(i => `<option value="${esc(i.id)}" ${i.id === selected ? 'selected' : ''}>${esc(itemLabel(i))}</option>`).join('');
   const renderSpecies = () => {
-    $('#feedInfo').textContent = feed
-      ? `Species linked to a Parkerville Wood Products item take its price per board foot. Their price lists are checked weekly; last checked ${fmtDate(feed.checked)}.`
-      : 'The Parkerville Wood Products price list could not be loaded just now, so prices are as last saved.';
-    speciesTable.innerHTML = `<tr><th>Name</th><th>Parkerville price list item</th><th>$ / board foot</th><th>Labor factor</th><th></th></tr>` + s.species.map((sp, i) => {
-      const linked = feed && sp.source && feed.items.some(item => item.id === sp.source);
-      return `<tr>
-      <td><input data-i="${i}" data-k="name" value="${esc(sp.name)}" aria-label="Species name" style="min-width:110px"></td>
-      <td><select data-i="${i}" data-k="source" aria-label="Parkerville price list item" style="min-width:300px" ${feed ? '' : 'disabled'}>
-        <option value="">Not linked: I set the price</option>
-        ${sp.source && !linked ? `<option value="${esc(sp.source)}" selected>${feed ? 'Linked item is no longer listed' : 'Linked'}</option>` : ''}
-        ${feed ? `<optgroup label="Domestic">${itemOptions('domestic', sp.source)}</optgroup><optgroup label="Exotic">${itemOptions('exotic', sp.source)}</optgroup>` : ''}
-      </select></td>
-      <td><input data-i="${i}" data-k="price" type="number" min="0" step="any" value="${esc(sp.price)}" aria-label="Price per board foot" style="min-width:80px" ${linked ? 'disabled title="Set by the linked price list item"' : ''}></td>
-      <td><input data-i="${i}" data-k="labor" type="number" min="0.1" step="0.05" value="${esc(sp.labor)}" aria-label="Labor factor"></td>
-      <td><button class="link" data-remove="${i}">remove</button></td></tr>`;
-    }).join('');
-    speciesTable.querySelectorAll('select:not(:disabled)').forEach(select => typeAhead(select, 440));
+    speciesTable.innerHTML = `<tr><th>Name</th><th>$ / board foot</th><th></th></tr>` + s.species.map((sp, i) => `<tr>
+      <td><input data-i="${i}" data-k="name" value="${esc(sp.name)}" aria-label="Species name" style="min-width:140px"></td>
+      <td><input data-i="${i}" data-k="price" type="number" min="0" step="any" value="${esc(sp.price)}" aria-label="Price per board foot" style="min-width:80px"></td>
+      <td><button class="link" data-remove="${i}">remove</button></td></tr>`).join('');
   };
   renderSpecies();
-  $('#stateTax').addEventListener('input', e => {
-    s.state_tax[e.target.dataset.state] = inputValue(e.target);
-    settingsChanged();
-  });
   speciesTable.addEventListener('input', e => {
     const { i, k } = e.target.dataset;
     if (i === undefined) return;
     s.species[i][k] = inputValue(e.target);
-    if (k === 'source') {
-      const item = feed?.items.find(x => x.id === e.target.value);
-      if (item) s.species[i].price = item.price;
-    }
     settingsChanged();
-    if (k === 'source') renderSpecies();
   });
   speciesTable.addEventListener('click', e => {
     if (e.target.dataset.remove === undefined) return;
@@ -4013,17 +3022,16 @@ function showSettings() {
     renderSpecies();
   });
   $('#addSpecies').addEventListener('click', () => {
-    s.species.push({ name: '', price: 0, labor: 1, source: '' });
+    s.species.push({ name: '', price: 0 });
     settingsChanged();
     renderSpecies();
     speciesTable.querySelector('tr:last-child input').focus();
   });
 
   $('#export').addEventListener('click', () => {
-    const { shopifyConnected, ...backup } = store;
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
-    a.download = `shop-tracker-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(store, null, 2)], { type: 'application/json' }));
+    a.download = `home-projects-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
   });
@@ -4034,7 +3042,7 @@ function showSettings() {
     if (!file) return;
     let backup;
     try { backup = JSON.parse(await file.text()); } catch { backup = null; }
-    if (!backup || !Array.isArray(backup.projects) || !backup.settings) return toast('That file is not a Shop Tracker backup.');
+    if (!backup || !Array.isArray(backup.projects) || !backup.settings) return toast('That file is not a Home Projects backup.');
     if (!confirm(`Replace the ${store.projects.length} project(s) here with the ${backup.projects.length} in this backup?`)) return;
     try {
       await save();
@@ -4049,89 +3057,6 @@ function showSettings() {
     toast('Backup imported.');
   });
 }
-
-// ---------- new-order bell ----------
-// The bell in the header counts Shopify orders placed since it was last opened (on any device).
-// Opening it lists the latest orders, with the new ones marked, and clears the count.
-let bell = { orders: [], open: false, busy: false };
-const ago = iso => {
-  const min = Math.round((Date.now() - Date.parse(iso)) / 60000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min} min ago`;
-  if (min < 24 * 60) return `${Math.round(min / 60)} h ago`;
-  const days = Math.round(min / 1440);
-  return days < 7 ? `${days} day${days === 1 ? '' : 's'} ago` : fmtDate(iso);
-};
-const FULFILLMENT = { UNFULFILLED: 'Unfulfilled', FULFILLED: 'Fulfilled', PARTIALLY_FULFILLED: 'Partly fulfilled', IN_PROGRESS: 'In progress', ON_HOLD: 'On hold', SCHEDULED: 'Scheduled' };
-
-function showBellCount() {
-  const n = bell.open ? 0 : bell.orders.filter(o => o.new).length;
-  const el = $('#bellCount');
-  el.hidden = !n;
-  el.textContent = n > 9 ? '9+' : String(n);
-  $('#bell').setAttribute('aria-label', n ? `${n} new order${n === 1 ? '' : 's'}` : 'Orders');
-  // On a home-screen app that is allowed to, the count shows on the app icon too.
-  try { n ? (navigator as any).setAppBadge?.(n) : (navigator as any).clearAppBadge?.(); } catch {}
-}
-
-function renderBellPanel(error = '') {
-  const fresh = bell.orders.filter(o => o.new), earlier = bell.orders.filter(o => !o.new).slice(0, Math.max(3, 8 - fresh.length));
-  // The product line run an order's units are being made in, if one is open.
-  const runOf = o => store.projects.find(p => isBatch(p) && !archived(p) && p.data.batch.orders?.some(x => x.name === o.name));
-  const row = o => `<li class="${o.new ? 'new' : ''}"><a href="${esc(o.url)}" target="_blank" rel="noopener">
-      <span class="ohead"><b>${esc(o.name)}</b><span class="muted">${esc(ago(o.created_at))}</span><span class="amt">${money(o.total)}</span></span>
-      <span class="oitems">${o.items.map(i => `${esc(i.title)}${i.variant ? ` (${esc(i.variant)})` : ''} &times; ${i.qty}`).join(', ')}</span>
-      ${FULFILLMENT[o.fulfillment] ? `<span class="pill ${o.fulfillment === 'FULFILLED' ? 'accepted' : ''}">${FULFILLMENT[o.fulfillment]}</span>` : ''}
-    </a>${runOf(o) ? `<a class="orun" href="#/p/${runOf(o).id}">In the ${esc(projectName(runOf(o)))} run &rarr;</a>` : ''}</li>`;
-  $('#bellPanel').innerHTML = `
-    <div class="bellhead"><b>Shop orders</b><button type="button" class="bellclose" aria-label="Close">&times;</button></div>
-    ${error ? `<p class="note err">${esc(error)}</p>` : ''}
-    ${fresh.length ? `<h4>New</h4><ul>${fresh.map(row).join('')}</ul>` : `<p class="muted bellnone">No new orders since you last looked.</p>`}
-    ${earlier.length ? `<h4>Earlier</h4><ul>${earlier.map(row).join('')}</ul>` : ''}
-    <a class="bellall" href="https://admin.shopify.com/store/vtza5i-0a/orders" target="_blank" rel="noopener">All orders in Shopify</a>`;
-}
-
-let bellError = '';
-async function loadNewOrders() {
-  if (!store.shopifyConnected || bell.busy) return;
-  bell.busy = true;
-  try {
-    const res = await fetch('/api/new-orders', { cache: 'no-store' });
-    const data = res.ok || res.status === 502 ? await res.json() : null;
-    if (data?.connected) {
-      $('#bellWrap').hidden = false;
-      bellError = data.error ? "Couldn't reach Shopify just now." : '';
-      if (!data.error) {
-        // Orders already shown as new in the open panel stay marked until it closes.
-        const shownNew = new Set(bell.open ? bell.orders.filter(o => o.new).map(o => o.id) : []);
-        bell.orders = data.orders.map(o => ({ ...o, new: o.new || shownNew.has(o.id) }));
-      }
-      showBellCount();
-      if (bell.open) { renderBellPanel(bellError); markOrdersSeen(); }
-    }
-  } catch {}
-  bell.busy = false;
-}
-
-function markOrdersSeen() {
-  const newest = bell.orders.find(o => o.new);   // newest first
-  if (newest) api('/api/new-orders/seen', { upTo: newest.created_at }).catch(() => {});
-}
-
-function setBell(open) {
-  if (bell.open === open) return;
-  bell.open = open;
-  $('#bellPanel').hidden = !open;
-  $('#bell').setAttribute('aria-expanded', String(open));
-  if (open) { renderBellPanel(bellError); markOrdersSeen(); loadNewOrders(); }
-  else bell.orders.forEach(o => { o.new = false; });
-  showBellCount();
-}
-$('#bell').addEventListener('click', () => setBell(!bell.open));
-$('#bellPanel').addEventListener('click', e => { if ((e.target as Element).closest('.bellclose, .orun')) setBell(false); });
-document.addEventListener('click', e => { if (bell.open && !(e.target as Element).closest('#bellWrap')) setBell(false); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') setBell(false); });
-window.addEventListener('hashchange', () => setBell(false));
 
 // On a phone app the stream band on the Projects page pins just under the status bar. A fixed bar
 // behind the status bar takes the color of the stream at the top of the screen (the page background
@@ -4163,14 +3088,7 @@ window.addEventListener('hashchange', () => requestAnimationFrame(markStuckBands
 
 backfillTodos();
 route();
-loadPrices();
-loadNewOrders();
-loadShopProducts().then(loadShopOrders);
-// While the page is open, check for new and fulfilled orders every few minutes.
-setInterval(() => { if (document.visibilityState === 'visible') loadShopOrders(); }, 5 * 60 * 1000);
-// and for the bell every couple of minutes.
-setInterval(() => { if (document.visibilityState === 'visible') loadNewOrders(); }, 2 * 60 * 1000);
 // Pick up other devices' changes when coming back to this tab, and send pending ones when leaving it.
-document.addEventListener('visibilitychange', () => document.visibilityState === 'hidden' ? save(true) : (loadNewOrders(), refresh().then(loadShopOrders)));
+document.addEventListener('visibilitychange', () => document.visibilityState === 'hidden' ? save(true) : refresh());
 window.addEventListener('pagehide', () => save(true));
 window.addEventListener('online', () => save());

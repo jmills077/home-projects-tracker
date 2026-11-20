@@ -1,162 +1,82 @@
 # Home Projects Tracker
 
-Planning and cost tracking for house projects and hobby woodworking builds, shared between the
-people working on them. It started as a copy of the J.M. Woodwork Shop Tracker; the sections below
-still describe that app and will be updated as the client-work features (quotes, Shopify, batch runs)
-are taken out.
+Planning and cost tracking for house projects and hobby woodworking builds. Each project is either
+**Home improvement** (work on the house) or a **Shop build** (a piece built in the shop for the home),
+and moves through four phases: **Ideation, Design, Build, Install**. Each one has its own to-do list,
+shopping list, cut list, design notes, receipts and a budget to spend against.
 
-## Origin: Shop Tracker
-
-Quotes, scheduling and to-do lists for a custom furniture shop: price a piece, send the
-client a printable quote, track each job through its phases on a board and a calendar, and keep
-each job's to-do and lumber shopping lists. Lumber is priced from Parkerville Wood Products' price
-lists, refreshed weekly.
-
-It runs on Cloudflare: a single [Worker](https://developers.cloudflare.com/workers/) built with
-[Hono](https://hono.dev), with [D1](https://developers.cloudflare.com/d1/) (SQLite) for storage.
-Everything is TypeScript.
+It started as a copy of the J.M. Woodwork Shop Tracker, with the client work taken out (quotes,
+pricing, Shopify, small-batch runs, tax set-asides). It runs on Cloudflare: a single
+[Worker](https://developers.cloudflare.com/workers/) built with [Hono](https://hono.dev), with
+[D1](https://developers.cloudflare.com/d1/) (SQLite) for storage. Everything is TypeScript.
 
 ## Run it locally
 
-Everything runs on your machine. `wrangler dev` simulates the Worker, D1 and the cron trigger
-locally, so you don't need a Cloudflare account or login.
-
-Requirements: Node.js 22.18 or newer (the seed script is TypeScript run directly by Node).
-
 ```sh
 npm install
-cp .dev.vars.example .dev.vars    # local secrets: sign-in password (default: shop), optional Shopify app
-npm run setup:local               # creates the local database and loads the saved price list
+cp .dev.vars.example .dev.vars    # local sign-in password (default: home)
+npm run setup:local               # creates the local database
 npm run dev                       # http://localhost:8787
 ```
 
 Sign in with the password from `.dev.vars`. Local data lives in `.wrangler/state/`;
-`npm run db:reset:local` wipes it and starts over.
-
-To run the weekly price check by hand while `npm run dev` is running (this one step does go out to
-the internet, to read Parkerville's pages):
-
-```sh
-curl -X POST "http://localhost:8787/cdn-cgi/local/explorer/api/local/scheduled?worker=jmwoodwork-shoptracker" \
-  -H 'Content-Type: application/json' -d '{"cron":"17 9 * * 1"}'
-```
-
-Reload the app afterwards and linked species pick up the new prices.
+`npm run db:reset:local` wipes it and starts over. Receipt reading uses Workers AI, which runs on
+Cloudflare even under `npm run dev`, so it needs `npx wrangler login`.
 
 | Command | What it does |
 | --- | --- |
 | `npm run dev` | Local server with hot reload (rebuilds the browser script too) |
-| `npm run setup:local` | Apply migrations and seed prices into the local database |
+| `npm run setup:local` | Apply migrations to the local database |
 | `npm run db:reset:local` | Delete local data and set it up again |
-| `npm run typecheck` | Type-check the Worker, the browser script and the scripts |
+| `npm run typecheck` | Type-check the Worker and the browser script |
 | `npm run deploy` | Apply migrations to the Cloudflare database, then deploy (see [DEPLOYMENT.md](DEPLOYMENT.md)) |
 
 ## Put it on your phone's home screen
 
-The site can be installed like an app, with its own icon, opening full screen.
-
-- **iPhone or iPad:** open the site in Safari, tap the Share button, then **Add to Home Screen**, then **Add**.
+- **iPhone or iPad:** open the site in Safari, tap Share, then **Add to Home Screen**.
 - **Android:** open the site in Chrome, tap the ⋮ menu, then **Add to Home screen** (or **Install app**).
 
-Sign in once from the home-screen icon: it keeps its own sign-in, separate from the browser's.
-A sign-in lasts 90 days and is renewed whenever the app is used, so it only asks again after
-three months without opening it, or after `APP_PASSWORD` is changed.
-The manifest and icons are in `public/`. The icons are the "J.M." from the J.M. Woodwork logo (in the branding files), in cream on the brand red.
+Sign in once from the home-screen icon; it keeps its own sign-in, which lasts 90 days and renews
+whenever the app is used. The manifest and icons are in `public/`.
 
 ## How it fits together
 
 ```
 src/
-  index.tsx          Hono app: sign-in, the app page, the JSON API, the weekly cron
+  index.tsx          Hono app: sign-in, the app page, the JSON API
   env.ts             Worker bindings (DB, ASSETS, AI) and secrets
   lib/auth.ts        Single-password sign-in with a signed session cookie
   lib/db.ts          D1 reads and writes
-  lib/prices.ts      Reads Parkerville's price lists (runs from the cron)
-  lib/receipts.ts    Reads a receipt photo into line items (Workers AI)
+  lib/receipts.ts    Keeps receipt photos and reads them into line items (Workers AI)
   views/             Page templates (Hono JSX): the app page, sign-in
-  client/app.ts      The app in the browser: every screen, the estimating model, to-do lists
+  client/app.ts      The app in the browser: every screen
+  client/skp.ts      Reads a SketchUp model or OpenCutList CSV into a cut list
+  client/xlsx.ts     Writes the Excel export
   shared/types.ts    Shapes shared by the server and the browser
 public/app.css       Stylesheet (public/app.js is built from src/client)
 migrations/          D1 schema
-seed/                Last saved price list, loaded by `npm run setup:local`
-scripts/             Seed script
 ```
 
-- **The app page** (`GET /`) is rendered by the Worker with the shop's data embedded in it. The
-  browser script draws each screen from that data, exactly as the original single-file app did.
-- **Saving.** Every change is sent to `POST /api/save` shortly after it's made: only the projects
-  that changed, plus the settings if they changed. When the tab comes back into view, the latest
-  data is fetched, so edits on another device show up. When two devices edit the same project,
-  the most recent edit wins.
-- **Todoist** (removed). The app used to make a Todoist project per job. The to-do lists below
-  replaced it, and the app no longer talks to Todoist. The `projects.todoist` column is left as it
-  was so older data isn't lost; the `TODOIST_TOKEN` secret can be deleted from the Worker.
-- **Small-batch runs.** The Product line tab has a quick form for a batch of one of the shop's
-  products. Products, variants and prices come from the jmwood.work Shopify storefront
-  (`GET /api/shop-products` reads its public `products.json` for the collection on the Small Batch
-  Projects page, kept in the database for an hour and used as a fallback when the shop answers
-  "too many requests"); per-unit cost, hours and materials are filled in on the Products page and kept in
-  the settings. A run is a product-line project with a `data.batch` section, due on its ship-by
-  date.
-  With the Shopify app connected (`SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET`, see
-  DEPLOYMENT.md), `GET /api/shop-orders` reads unfulfilled orders through the Admin API and each
-  product gets one open run holding everything still owed (`src/lib/shopify.ts`).
-- **Frozen projects.** A project can be frozen from its Status box when a client goes quiet or a job
-  hits a long delay. It keeps its status, phase and dates (in `data.frozen`) but leaves the board,
-  the stats and the calendar for the Frozen list (`#/frozen`).
-  Unfreezing puts it back where it was and offers to push its due dates back by the time it spent frozen. No migration: it's
-  part of the project's data.
-- **Tasks.** Every project gets its own to-do list and lumber store shopping list the moment it is
-  created (`data.todo`: `items`, `lumber` and a `log` of everything added, checked off, unchecked or
-  removed). The Tasks page (`#/tasks`) lists the active projects (nearest due date first until you press and hold a project to move it; that order is saved in the settings and shared by every device, new projects slot in by due date, and **Sort by due date** goes back to the default), then the frozen and finished ones; its **All to-dos** tab (`#/tasks/todos`) lists every open to-do item from the active projects in that same order; its **Shopping list** tab (`#/tasks/shopping`) gathers every
-  active project's shopping list in one place to check off (checking there checks the project's own list). It opens **By species**: lumber grouped by wood species with thickness, width, length and how many read from how each item is written (a dash when it isn't given; plywood and other sheet goods always show their thickness, written as 3/4", 3/4 in, ¾, .75" or 18mm, and are flagged when it's missing), and everything else under Other supplies; **By project** shows each project's list and is where items are added; each project opens its list at
-  `#/tasks/<id>`, also linked as a tab on the project's page. Checked-off items stay on the list, struck
-  through, with the date they were done. Press and hold an item to drag it up or down. Pasting several lines into the add box adds
-  one item per line (bullets, numbers and checkboxes are stripped; a single line splits on semicolons). When a project
-  is marked Complete (or a client job goes straight to Delivered & paid), everything still open is
-  checked off. Projects from before this got a list on first load. No migration: it's part of the
-  project's data.
-- **Receipts and material purchases.** **Scan a receipt** (on the Projects page, or on a project's
-  Material purchases box or Summary) takes a photo with the phone's camera or picks one from the library. The
-  browser shrinks it and sends it to `POST /api/receipts/scan`, which first keeps the photo in the `receipts`
-  table (`migrations/0006_receipts.sql`, base64 JPEG, for taxes and audits) and then reads it with a vision model on
-  Workers AI (`src/lib/receipts.ts`, the `AI` binding: no API key, billed to the Cloudflare account
-  under the Workers AI free allowance). The lines come back to check over: fix a name or price, untick
-  what isn't for this job, pick the project, and the ticked lines (sales tax is a line of its own) are
-  added to its `data.purchases`, each naming its receipt by id; the receipt's store, date, total and tax are saved with
-  it (`POST /api/receipts`). Lines left over can go to another project from the same receipt. A receipt that can't be
-  read keeps its photo and the lines are typed in from it; a purchase with no receipt can be typed in too.
-  Each receipt has a Notes box (what was bought and why, `receipts.notes`), and ticking **General business expense** sends
-  the ticked lines to the receipt itself (`receipts.general`) instead of a project, for tools, shop supplies and the like.
-  **All receipts** (`#/receipts`, by year) lists every receipt kept with its notes, the projects its lines went to and its
-  general business lines (notes can be edited and general lines removed there). A receipt can be deleted there only while
-  nothing uses it.
-  Purchases don't change a quote or price. Under `npm run dev` the `AI` binding still runs on Cloudflare, so it
-  needs `npx wrangler login`.
-- **Project summary** (`#/p/<id>/summary`, the Summary tab): profit and loss for the project. Revenue is a client job's
-  agreed (or quoted) price before sales tax, a product run's Shopify sales (`data.batch.sales`, what each order paid for
-  that product, kept as orders sync so it survives shipping) or else the retail value of its units, or a figure typed in
-  (`data.revenue_actual`). Expenses are its material purchases. Hours worked are typed in (`data.hours_worked`), giving
-  a tax set-aside from profit: the project's state rate (the state picked on a client job, else the no-state
-  rate) plus income tax (Settings → Project summaries, 7% by default) and profit after it, and
-  profit per hour (after the set-aside) beside the project's hourly rate. Every receipt is listed with its photo (tap for full screen), and the
-  page prints or saves as a PDF with the photos.
-- **Export for QuickBooks** (on All receipts): pick a span of dates and download an Excel file (`src/client/xlsx.ts`
-  writes it in the browser, no library) with sheets for each project's summary, each receipt as one expense
-  (date, vendor, total, sales tax, category, Customer:Project, photo link), each expense line with its customer and
-  project, and income (client jobs on the day they were marked delivered, each Shopify order on its date, then
-  what's still expected), plus an About sheet saying how each figure is worked out.
-- **Prices.** A cron trigger runs every Monday at 09:17 UTC, reads Parkerville's price lists, and
-  replaces the `price_items` table. If a list can't be read, the previous prices stay.
-- **Sign-in.** One shop password, set as the `APP_PASSWORD` secret. Sessions last 30 days, and
-  changing the password signs every device out.
-- **R2** file storage (for photos and drawings) isn't set up yet. To add it, enable R2 in the Cloudflare dashboard, create a bucket, and add an `r2_buckets` binding in wrangler.jsonc.
-
-## Moving data from the old app
-
-The old app kept everything in the browser (or in a GitHub repository, if sync was on). To bring it over:
-
-1. In the old app, open **Settings → Backup → Export backup**.
-2. In this app, open **Settings → Backup → Import backup…** and choose the file.
-
-The import replaces all projects and settings, and quote numbers stay the same.
+- **The app page** (`GET /`) is rendered with every project embedded in it, and the browser script
+  draws each screen from that. Changes are sent to `POST /api/save` shortly after they're made (only
+  what changed). When the tab comes back into view the latest data is fetched, so edits on another
+  device show up. When two devices edit the same project, the most recent edit wins.
+- **Projects** keep their details as JSON in `projects.data`: name, room or area, wood, budget,
+  phase due dates (`stage_due`, with Install's as `due_date`), `todo` (to-do list, shopping list and
+  a log), `cutlist`, `design` notes, `purchases`, `hours_worked`, and `frozen` while on hold.
+- **Budget and costs.** Everything bought for a project (`data.purchases`, from scanned receipts or
+  typed in) counts against its budget. The Details page shows spent and left to spend; the Costs tab
+  lists every receipt with its photo, spending by month, and hours worked, and prints as a PDF.
+- **Lumber to buy.** Board feet come from what's typed in, or else the cut list plus the waste
+  allowance in Settings, and are turned into linear feet of whole boards for the width you can buy,
+  with a rough cost from the species price in Settings. One tap adds it to the shopping list.
+- **Tasks** (`#/tasks`): every active project's to-do list, in an order you can set by pressing and
+  holding; **All to-dos** in one list; and the **Shopping list** for every project, by wood species or
+  by project.
+- **Receipts.** A photo is shrunk in the browser and sent to `POST /api/receipts/scan`, which keeps it
+  (base64 JPEG in the `receipts` table) and reads it with a vision model on Workers AI. The lines come
+  back to check over, then go to a project, or to the receipt itself as **Not for a project** (tools,
+  supplies). **All receipts** (`#/receipts`) lists every receipt by year and downloads spending as Excel.
+- **Frozen projects** leave the board and calendar until unfrozen, keeping their phase and dates.
+- **Sign-in.** For now, one password set as the `APP_PASSWORD` secret. Accounts and shared households
+  are the next phase of work.

@@ -1,11 +1,11 @@
-// Sign-in with a single shop password (the APP_PASSWORD secret). A signed-in browser holds a
+// Sign-in with a single password (the APP_PASSWORD secret). A signed-in browser holds a
 // cookie carrying its expiry and a signature made with the password, so changing the password
 // signs every device out.
 import type { Context } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { App } from '../env';
 
-const COOKIE = 'shop_session';
+const COOKIE = 'home_session';
 const SESSION_DAYS = 90;
 // A session used within this many days of running out is extended, so a phone that opens the app
 // now and then (from its home screen, say) stays signed in.

@@ -1,5 +1,2 @@
 # Copy to .dev.vars for local development. Never commit .dev.vars.
-APP_PASSWORD=shop
-# Shopify Dev Dashboard app (read_orders, read_products). Leave empty to make batch runs by hand.
-SHOPIFY_CLIENT_ID=
-SHOPIFY_CLIENT_SECRET=
+APP_PASSWORD=home
