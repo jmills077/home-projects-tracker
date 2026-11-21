@@ -61,9 +61,13 @@ function cutBoardFeet(p) {
 
 // ---------- storage (the database, through the server) ----------
 // The page arrives with the projects embedded in it; changes are sent back to the server.
+// Who's signed in, the household they're looking at, the others in it, and their other households.
+let account = { me: { id: 0, name: '', email: '' }, household: { id: 0, name: '', role: 'member' }, households: [], members: [] };
 let store = loadStore(JSON.parse(document.getElementById('initialState').textContent));
+const myName = () => account.me.name.split(' ')[0] || account.me.name;
 
 function loadStore(saved: any) {
+  if (saved.me) account = { me: saved.me, household: saved.household, households: saved.households || [], members: saved.members || [] };
   return {
     settings: { ...structuredClone(DEFAULT_SETTINGS), ...(saved.settings || {}) },
     projects: Array.isArray(saved.projects) ? saved.projects : [],
@@ -198,6 +202,8 @@ async function refresh() {
     if (e.signedOut && !pendingChanges().any) location.assign('/login');
     return;
   }
+  // This browser was switched to another household (in another tab): start over on that one.
+  if (remote.household && remote.household.id !== account.household.id) return location.reload();
   // Something was edited while the request was out: leave it for the next refresh.
   if (seq !== changeSeq || saving || pendingChanges().any) return;
   const next = loadStore(remote);
@@ -1173,7 +1179,7 @@ async function createProject() {
   if (ed.creating) return;
   if (!String(ed.data.title || '').trim()) { toast('Give the project a name first.'); ($('[data-path="title"]') as HTMLElement)?.focus(); return; }
   const stamp = new Date().toISOString(), stream = ed.stream, status = 'planned';
-  const draft: any = { stream, status, stage: 'ideation', data: ed.data, calc: {}, history: [{ status, at: stamp }], created_at: stamp, updated_at: stamp };
+  const draft: any = { stream, status, stage: 'ideation', data: ed.data, calc: {}, history: [{ status, by: myName(), at: stamp }], created_at: stamp, updated_at: stamp };
   // Every project gets its to-do list the moment it is created.
   draft.data.todo = defaultTodo(draft);
   draft.calc = totals(draft);
@@ -1207,7 +1213,7 @@ function renderStatusCard() {
       : archived(p) ? '' : `<button class="btn" data-freeze="${p.id}">Freeze project</button><span class="muted" style="font-size:13px">For a project on hold: waiting on a contractor, the weather or the budget</span>`}</div>
     <label class="f" style="margin-top:12px"><span>Kind of project</span><select id="streamSelect">
       ${STREAMS.map(([k, n]) => `<option value="${k}" ${k === streamOf(p) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
-    <ul class="history">${p.history.map(h => `<li><span>${'frozen' in h ? (h.frozen ? `Frozen${h.note ? `: ${esc(h.note)}` : ''}` : 'Unfrozen') : h.stage ? `Phase: ${STAGE_NAME[h.stage] || esc(h.stage)}` : STATUS_NAME[h.status] || esc(h.status)}</span><span>${esc(fmtDate(h.at))}</span></li>`).join('')}</ul>`;
+    <ul class="history">${p.history.map(h => `<li><span>${'frozen' in h ? (h.frozen ? `Frozen${h.note ? `: ${esc(h.note)}` : ''}` : 'Unfrozen') : h.stage ? `Phase: ${STAGE_NAME[h.stage] || esc(h.stage)}` : STATUS_NAME[h.status] || esc(h.status)}</span><span>${h.by ? `${esc(h.by)} · ` : ''}${esc(fmtDate(h.at))}</span></li>`).join('')}</ul>`;
   card.querySelectorAll('[data-status]').forEach(b => b.addEventListener('click', () => setStatus(p, b.dataset.status)));
   renderNow(p);
   $('#statusSelect').addEventListener('change', e => setStatus(p, e.target.value));
@@ -1218,7 +1224,7 @@ function renderStatusCard() {
 function setStream(p, stream, stage = '') {
   if (stream === streamOf(p)) return;
   p.stream = stream;
-  if (stage && stage !== p.stage) { p.stage = stage; p.history.push({ stage, at: new Date().toISOString() }); }
+  if (stage && stage !== p.stage) { p.stage = stage; p.history.push({ stage, by: myName(), at: new Date().toISOString() }); }
   p.updated_at = new Date().toISOString();
   persist();
   toast(`Moved to ${STREAM_NAME[stream]}`);
@@ -1329,9 +1335,9 @@ function setStage(p, stage) {
   if (stage === stageOf(p)) return;
   p.stage = stage;
   p.updated_at = new Date().toISOString();
-  p.history.push({ stage, at: p.updated_at });
+  p.history.push({ stage, by: myName(), at: p.updated_at });
   // Moving a planned project past Ideation means work has started.
-  if (p.status === 'planned' && stage !== 'ideation') { p.status = 'in_progress'; p.history.push({ status: 'in_progress', at: p.updated_at }); }
+  if (p.status === 'planned' && stage !== 'ideation') { p.status = 'in_progress'; p.history.push({ status: 'in_progress', by: myName(), at: p.updated_at }); }
   persist();
 }
 
@@ -1339,7 +1345,7 @@ async function setStatus(p, status) {
   if (status === p.status) return;
   p.status = status;
   p.updated_at = new Date().toISOString();
-  p.history.push({ status, at: p.updated_at });
+  p.history.push({ status, by: myName(), at: p.updated_at });
   if (isFinished(p)) finishTodo(p);
   persist();
   if (ed?.project === p) renderStatusCard();
@@ -1353,7 +1359,7 @@ function freezeProject(p) {
   const at = new Date().toISOString();
   p.data.frozen = { at, reason: reason.trim() };
   p.updated_at = at;
-  p.history.push({ frozen: true, at, ...(reason.trim() ? { note: reason.trim() } : {}) });
+  p.history.push({ frozen: true, by: myName(), at, ...(reason.trim() ? { note: reason.trim() } : {}) });
   persist();
   toast(`${projectName(p)} is frozen. It's under Frozen on the Projects page.`);
   route();
@@ -1373,7 +1379,7 @@ function unfreezeProject(p) {
   delete p.data.frozen;
   const at = new Date().toISOString();
   p.updated_at = at;
-  p.history.push({ frozen: false, at });
+  p.history.push({ frozen: false, by: myName(), at });
   persist();
   toast(`${projectName(p)} is back on the board.`);
   route();
@@ -2968,6 +2974,123 @@ function wireCutList(p) {
   draw();
 }
 
+// ---------- account and household ----------
+// The household's people, inviting someone, switching households, and your own name and password.
+// These save straight away (not with the projects), and each answers with the fresh account state.
+async function accountCall(path, body = {}) {
+  const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (res.status === 401) { location.assign('/login'); throw new Error('Signed out'); }
+  const out = await res.json().catch(() => ({ error: `The server returned ${res.status}.` }));
+  if (out.error) { toast(out.error); throw new Error(out.error); }
+  return out;
+}
+// Starts the app over on whichever household the server now says (after a switch, a new one, or leaving).
+const reloadHome = () => { location.hash = '#/'; location.reload(); };
+
+function householdCards() {
+  const owner = account.household.role === 'owner', me = account.me;
+  const others = account.households.filter(h => h.id !== account.household.id);
+  return `
+    <div class="card" id="householdCard"><h2>Household</h2>
+      <p class="muted" style="margin-top:0">Everyone here sees and changes the same projects, lists and receipts.</p>
+      <div class="grid"><label class="f w6"><span>Household name</span><input id="hhName" value="${esc(account.household.name)}"></label></div>
+      <ul class="people">${account.members.map(m => `<li data-id="${m.id}">
+        <span class="who"><b>${esc(m.name)}</b>${m.id === me.id ? ' (you)' : ''}<small>${esc(m.email)} · ${m.role === 'owner' ? 'Owner' : 'Member'} · joined ${esc(fmtDate(m.joined_at))}</small></span>
+        <span class="acts">${m.id === me.id ? '' : owner ? `
+          <button class="link" data-reset="${m.id}">Password link</button>
+          ${m.role === 'owner' ? '' : `<button class="link" data-owner="${m.id}">Make owner</button>`}
+          <button class="link danger" data-remove="${m.id}">Remove</button>` : ''}</span></li>`).join('')}</ul>
+      <div class="actions"><button class="btn primary" id="invite">Invite someone</button></div>
+      <div id="linkBox" hidden></div>
+      ${account.members.length > 1 ? `<p class="muted small" style="margin-bottom:0"><button class="link danger" id="leave">Leave ${esc(account.household.name)}</button></p>` : ''}
+    </div>
+    <div class="card" id="householdsCard"><h2>Your households</h2>
+      ${others.length ? `<p class="muted" style="margin-top:0">You're looking at <b>${esc(account.household.name)}</b>. Switch to:</p>
+        <div class="actions">${others.map(h => `<button class="btn" data-switch="${h.id}">${esc(h.name)}</button>`).join('')}</div>`
+        : `<p class="muted" style="margin-top:0">You're only in <b>${esc(account.household.name)}</b>. To share projects with someone else's home too, ask them for an invite link.</p>`}
+      <p class="muted small" style="margin-bottom:0"><button class="link" id="newHousehold">+ Start a separate household</button> (for projects you don't want shared with this one)</p>
+    </div>
+    <div class="card" id="accountCard"><h2>Your account</h2>
+      <div class="grid">
+        <label class="f w3"><span>Name</span><input id="meName" value="${esc(me.name)}" autocomplete="name"></label>
+        <label class="f w3"><span>Email (you sign in with it)</span><input id="meEmail" type="email" value="${esc(me.email)}" autocomplete="username"></label>
+      </div>
+      <div class="actions"><button class="btn" id="saveMe">Save name and email</button></div>
+      <form id="pwForm" class="grid" style="margin-top:14px">
+        <label class="f w3"><span>Current password</span><input name="current" type="password" autocomplete="current-password" required></label>
+        <label class="f w3"><span>New password</span><input name="next" type="password" autocomplete="new-password" minlength="8" required></label>
+        <div class="actions"><button class="btn">Change password</button></div>
+      </form>
+      <p class="muted small">Changing your password signs you out on your other devices.</p>
+      <form method="post" action="/logout"><button class="btn">Sign out on this device</button></form>
+    </div>`;
+}
+
+function showLink(title, out, note) {
+  const box = $('#linkBox');
+  box.hidden = false;
+  box.innerHTML = `<div class="note ok linkshare"><b>${esc(title)}</b>
+    <input readonly value="${esc(out.url)}" aria-label="Link">
+    <div class="actions">${navigator.share ? '<button class="btn small primary" data-share>Share…</button>' : ''}<button class="btn small" data-copy>Copy link</button></div>
+    <small>${esc(note)} It works once and lasts ${out.days} days.</small></div>`;
+  const input = box.querySelector('input');
+  input.addEventListener('focus', () => input.select());
+  box.querySelector('[data-copy]').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(out.url); toast('Link copied'); } catch { input.focus(); input.select(); }
+  });
+  box.querySelector('[data-share]')?.addEventListener('click', () => navigator.share({ title, url: out.url }).catch(() => {}));
+}
+
+function wireHouseholdCards() {
+  const redraw = out => { loadStore(out); showSettings(); };
+  const hhName = $('#hhName');
+  hhName.addEventListener('change', async () => redraw(await accountCall('/api/household/rename', { name: hhName.value })));
+  $('#invite').addEventListener('click', async () => {
+    showLink(`Join ${account.household.name}`, await accountCall('/api/invites'),
+      'Send this by text or email to the person you want to add. They make an account (or sign in) and join.');
+  });
+  $('#householdCard').addEventListener('click', async e => {
+    const b = (e.target as Element).closest<HTMLElement>('button');
+    if (!b) return;
+    const m = account.members.find(x => String(x.id) === (b.dataset.reset || b.dataset.owner || b.dataset.remove));
+    if (b.dataset.reset) showLink(`New password for ${m.name}`, await accountCall(`/api/members/${m.id}/reset-link`),
+      `Send this to ${m.name.split(' ')[0]}. Opening it lets them set a new password.`);
+    if (b.dataset.owner && confirm(`Make ${m.name} an owner too? Owners can remove people and make password links.`))
+      redraw(await accountCall(`/api/members/${m.id}/owner`));
+    if (b.dataset.remove && confirm(`Take ${m.name} out of ${account.household.name}? They won't see its projects any more.`))
+      redraw(await accountCall(`/api/members/${m.id}/remove`));
+  });
+  $('#leave')?.addEventListener('click', async () => {
+    if (!confirm(`Leave ${account.household.name}? Its projects stay with the others, and you won't see them any more.`)) return;
+    await save();
+    await accountCall(`/api/members/${account.me.id}/remove`);
+    reloadHome();
+  });
+  $('#householdsCard').addEventListener('click', async e => {
+    const b = (e.target as Element).closest<HTMLElement>('button');
+    if (!b) return;
+    if (b.dataset.switch) { await save(); await accountCall('/api/household/switch', { id: Number(b.dataset.switch) }); reloadHome(); }
+    if (b.id === 'newHousehold') {
+      const name = prompt('Name for the new household', `${myName()}'s workshop`);
+      if (!name?.trim()) return;
+      await save();
+      await accountCall('/api/household/new', { name });
+      reloadHome();
+    }
+  });
+  $('#saveMe').addEventListener('click', async () => {
+    redraw(await accountCall('/api/account', { name: $('#meName').value, email: $('#meEmail').value }));
+    toast('Saved');
+  });
+  $('#pwForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = e.target as HTMLFormElement;
+    await accountCall('/api/account/password', { current: f.current.value, next: f.next.value });
+    f.reset();
+    toast('Password changed');
+  });
+}
+
 // ---------- settings ----------
 function showSettings() {
   const s = store.settings;
@@ -2975,6 +3098,7 @@ function showSettings() {
     `<label class="f ${cls}"><span>${label}</span><input data-path="${key}" type="${type}" ${type === 'number' ? 'min="0" step="any"' : ''} value="${esc(s[key])}"></label>`;
   view.innerHTML = `
     <div class="pagehead"><h1>Settings</h1><span class="spacer"></span><span class="muted">Changes save automatically</span></div>
+    ${householdCards()}
     <div class="card" id="general">
       <fieldset><h2>Lumber</h2><div class="grid">
         ${inp('Waste allowance (%)', 'waste_pct', 'number', 'w3')}
@@ -2986,14 +3110,12 @@ function showSettings() {
       <p><button class="link" id="addSpecies">+ Add species</button></p>
     </div>
     <div class="card"><h2>Backup</h2>
-      <p class="muted">Projects and settings are stored on the server and shared by every device you sign in on. Export a backup now and then to keep a copy of your own.</p>
+      <p class="muted">Projects and settings are stored on the server and shared by everyone in the household, on every device. Export a backup now and then to keep a copy of your own. Importing one replaces this household's projects.</p>
       <div class="actions"><button class="btn" id="export">Export backup</button>
         <button class="btn" id="import">Import backup&hellip;</button><input type="file" id="importFile" accept="application/json,.json" hidden></div>
     </div>
-    <div class="card"><h2>This device</h2>
-      <p class="muted">Signing out means typing the password again next time, on this device only. Other devices stay signed in.</p>
-      <form method="post" action="/logout"><button class="btn">Sign out</button></form>
-    </div>`;
+`;
+  wireHouseholdCards();
 
   $('#general').addEventListener('input', e => {
     if (!e.target.dataset.path) return;

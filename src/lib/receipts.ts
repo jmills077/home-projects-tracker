@@ -88,18 +88,18 @@ const MAX_STORED_CHARS = 1_900_000;
 const checkId = (id: unknown) => { if (typeof id !== 'string' || !ID.test(id)) throw new ReceiptError('Not a receipt id.'); return id; };
 
 /** Keeps a receipt photo (sent as a data URL), creating the receipt if it's new. */
-export async function keepPhoto(db: D1Database, id: unknown, image: string) {
+export async function keepPhoto(db: D1Database, hid: number, id: unknown, image: string) {
   const m = image.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
   if (!m) throw new ReceiptError('That photo could not be read. Try taking it again.');
   if (m[2].length > MAX_STORED_CHARS) throw new ReceiptError('That photo is too large to keep. Try taking it again.');
-  await db.prepare(`INSERT INTO receipts (id, mime, image, created_at) VALUES (?, ?, ?, ?)
-    ON CONFLICT (id) DO UPDATE SET mime = excluded.mime, image = excluded.image`)
-    .bind(checkId(id), m[1], m[2], new Date().toISOString()).run();
+  await db.prepare(`INSERT INTO receipts (id, household_id, mime, image, created_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET mime = excluded.mime, image = excluded.image WHERE receipts.household_id = excluded.household_id`)
+    .bind(checkId(id), hid, m[1], m[2], new Date().toISOString()).run();
 }
 
 /** Saves what a receipt says (store, date, total, tax, notes), creating it without a photo if it's new.
  *  `general` (its lines that aren't for any one project) is replaced only when it's sent. */
-export async function saveReceipt(db: D1Database, r: any) {
+export async function saveReceipt(db: D1Database, hid: number, r: any) {
   const text = (v: unknown, n: number) => String(v ?? '').trim().slice(0, n);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(String(r?.date)) ? String(r.date) : '';
   let general: string | null = null;
@@ -108,37 +108,39 @@ export async function saveReceipt(db: D1Database, r: any) {
     general = JSON.stringify(r.general.map((l: any) => ({ id: text(l?.id, 40), item: text(l?.item, 300), qty: money(l?.qty) || 1, amount: money(l?.amount) }))
       .filter((l: GeneralLine) => l.id && l.item));
   }
-  await db.prepare(`INSERT INTO receipts (id, store, date, total, tax, notes, general, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  await db.prepare(`INSERT INTO receipts (id, household_id, store, date, total, tax, notes, general, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (id) DO UPDATE SET store = excluded.store, date = excluded.date, total = excluded.total, tax = excluded.tax, notes = excluded.notes,
-      general = CASE WHEN ? THEN excluded.general ELSE receipts.general END`)
-    .bind(checkId(r?.id), text(r?.store, 200), date, money(r?.total), money(r?.tax), text(r?.notes, 4000), general ?? '[]', new Date().toISOString(), general !== null ? 1 : 0).run();
+      general = CASE WHEN ? THEN excluded.general ELSE receipts.general END
+    WHERE receipts.household_id = excluded.household_id`)
+    .bind(checkId(r?.id), hid, text(r?.store, 200), date, money(r?.total), money(r?.tax), text(r?.notes, 4000), general ?? '[]', new Date().toISOString(), general !== null ? 1 : 0).run();
 }
 
-export async function listReceipts(db: D1Database): Promise<ReceiptRecord[]> {
-  const rows = await db.prepare(`SELECT id, store, date, total, tax, notes, general, mime != '' AS has_photo, length(image) AS photo_v, created_at FROM receipts ORDER BY date DESC, created_at DESC`)
+export async function listReceipts(db: D1Database, hid: number): Promise<ReceiptRecord[]> {
+  const rows = await db.prepare(`SELECT id, store, date, total, tax, notes, general, mime != '' AS has_photo, length(image) AS photo_v, created_at
+    FROM receipts WHERE household_id = ? ORDER BY date DESC, created_at DESC`).bind(hid)
     .all<Omit<ReceiptRecord, 'has_photo' | 'general'> & { has_photo: number; general: string }>();
   return rows.results.map(r => ({ ...r, general: JSON.parse(r.general || '[]'), has_photo: !!r.has_photo }));
 }
 
 /** Takes a receipt's photo off (the wrong one was kept); its store, date, total and lines stay. */
-export async function removePhoto(db: D1Database, id: unknown) {
-  await db.prepare(`UPDATE receipts SET mime = '', image = '' WHERE id = ?`).bind(checkId(id)).run();
+export async function removePhoto(db: D1Database, hid: number, id: unknown) {
+  await db.prepare(`UPDATE receipts SET mime = '', image = '' WHERE id = ? AND household_id = ?`).bind(checkId(id), hid).run();
 }
 
-export async function readPhoto(db: D1Database, id: string) {
+export async function readPhoto(db: D1Database, hid: number, id: string) {
   if (!ID.test(id)) return null;
-  const row = await db.prepare(`SELECT mime, image FROM receipts WHERE id = ? AND mime != ''`).bind(id).first<{ mime: string; image: string }>();
+  const row = await db.prepare(`SELECT mime, image FROM receipts WHERE id = ? AND household_id = ? AND mime != ''`).bind(id, hid).first<{ mime: string; image: string }>();
   if (!row) return null;
   return { mime: row.mime, bytes: Uint8Array.from(atob(row.image), c => c.charCodeAt(0)) };
 }
 
 /** Deletes a receipt, but only one no project's purchases point to (so nothing filed for taxes goes missing). */
-export async function deleteReceipt(db: D1Database, id: unknown) {
+export async function deleteReceipt(db: D1Database, hid: number, id: unknown) {
   checkId(id);
   const used = await db.prepare(`SELECT 1 FROM projects, json_each(projects.data, '$.purchases') AS x
-    WHERE json_extract(x.value, '$.receipt') = ? LIMIT 1`).bind(id).first();
+    WHERE projects.household_id = ? AND json_extract(x.value, '$.receipt') = ? LIMIT 1`).bind(hid, id).first();
   if (used) throw new ReceiptError('Lines from this receipt are still on a project. Remove them from the project first.');
-  const general = await db.prepare(`SELECT 1 FROM receipts WHERE id = ? AND general != '[]'`).bind(id).first();
+  const general = await db.prepare(`SELECT 1 FROM receipts WHERE id = ? AND household_id = ? AND general != '[]'`).bind(id, hid).first();
   if (general) throw new ReceiptError("This receipt has lines that aren't for a project. Remove them first.");
-  await db.prepare('DELETE FROM receipts WHERE id = ?').bind(id).run();
+  await db.prepare('DELETE FROM receipts WHERE id = ? AND household_id = ?').bind(id, hid).run();
 }
