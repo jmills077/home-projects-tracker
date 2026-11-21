@@ -15,6 +15,10 @@ jmwood.work Cloudflare account. Cloudflare's Workers Builds deploys it from this
 3. **Create the tables** if the first deploy didn't: `npm run db:migrate:remote`.
 
 The site is then at `https://home-projects-tracker.<your-subdomain>.workers.dev`.
+The live site: https://home-projects-tracker.jonathan-a83.workers.dev
+
+If a merge to main doesn't start a build, check the Worker's **Settings → Build** for a "disconnected from
+your Git account" banner: the Cloudflare GitHub app needs this repo under its Repository access.
 
 ## Updating
 
