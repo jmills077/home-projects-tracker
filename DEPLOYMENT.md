@@ -9,8 +9,9 @@ jmwood.work Cloudflare account. Cloudflare's Workers Builds deploys it from this
    repository**, pick `home-projects-tracker`, and keep the Worker name `home-projects-tracker`
    (it has to match `name` in `wrangler.jsonc`). Set the deploy command to `npm run deploy`, so new
    migrations are applied before each deploy.
-2. **Set the password.** Worker → **Settings → Variables and Secrets → Add**, type *Secret*, name
-   `APP_PASSWORD`. Or from a terminal: `npx wrangler secret put APP_PASSWORD`.
+2. **Set the site password.** Worker → **Settings → Variables and Secrets → Add**, type *Secret*, name
+   `APP_PASSWORD`. Or from a terminal: `npx wrangler secret put APP_PASSWORD`. It's used once, on
+   the first visit, to set up the first account (everyone after joins by invite link).
 3. **Create the tables** if the first deploy didn't: `npm run db:migrate:remote`.
 
 The site is then at `https://home-projects-tracker.<your-subdomain>.workers.dev`.

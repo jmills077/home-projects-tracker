@@ -31,33 +31,34 @@ export class BadRequest extends Error {}
 const json = (v: unknown, fallback: unknown) => JSON.stringify(v ?? fallback);
 
 // Writes a project as given, keeping its id. Only replaces a stored copy that isn't newer.
-const upsertProject = (db: D1Database, p: Project) => db.prepare(`
-  INSERT INTO projects (id, stream, status, stage, data, calc, history, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+// Another household's project with the same id is never touched.
+const upsertProject = (db: D1Database, hid: number, p: Project) => db.prepare(`
+  INSERT INTO projects (id, household_id, stream, status, stage, data, calc, history, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT (id) DO UPDATE SET
     stream = excluded.stream, status = excluded.status, stage = excluded.stage, data = excluded.data,
     calc = excluded.calc, history = excluded.history, updated_at = excluded.updated_at
-  WHERE excluded.updated_at >= projects.updated_at`)
-  .bind(p.id, streamOf(p), p.status, p.stage || 'ideation',
+  WHERE excluded.updated_at >= projects.updated_at AND projects.household_id = excluded.household_id`)
+  .bind(p.id, hid, streamOf(p), p.status, p.stage || 'ideation',
     json(p.data, {}), json(p.calc, {}), json(p.history, []), p.created_at, p.updated_at);
 
 // Settings are stored with the time they were last changed; an older copy never replaces a newer one.
-const putSettings = (db: D1Database, settings: Settings, updatedAt: string) => db.prepare(`
-  INSERT INTO settings (key, value) VALUES ('settings', ?)
+const putSettings = (db: D1Database, hid: number, settings: Settings, updatedAt: string) => db.prepare(`
+  INSERT INTO settings (key, value) VALUES ('settings:' || ?, ?)
   ON CONFLICT (key) DO UPDATE SET value = excluded.value
   WHERE json_extract(excluded.value, '$.updatedAt') >= json_extract(settings.value, '$.updatedAt')`)
-  .bind(JSON.stringify({ settings, updatedAt: updatedAt || '' }));
+  .bind(hid, JSON.stringify({ settings, updatedAt: updatedAt || '' }));
 
 async function getSetting<T>(db: D1Database, key: string): Promise<T | null> {
   const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
   return row ? JSON.parse(row.value) : null;
 }
 
-/** Everything the browser app starts from, apart from whether Shopify is connected. */
-export async function getState(db: D1Database) {
+/** A household's projects and settings: what the browser app starts from. */
+export async function getState(db: D1Database, hid: number) {
   const [saved, projects] = await Promise.all([
-    getSetting<{ settings: Settings; updatedAt: string }>(db, 'settings'),
-    db.prepare('SELECT * FROM projects ORDER BY id').all<ProjectRow>(),
+    getSetting<{ settings: Settings; updatedAt: string }>(db, `settings:${hid}`),
+    db.prepare('SELECT * FROM projects WHERE household_id = ? ORDER BY id').bind(hid).all<ProjectRow>(),
   ]);
   return {
     settings: saved?.settings ?? null,   // null until first saved: the browser fills in its defaults
@@ -68,43 +69,47 @@ export async function getState(db: D1Database) {
 
 export interface Changes { projects?: unknown[]; deleted?: unknown[]; settings?: Settings; settingsUpdatedAt?: string }
 
-export async function saveChanges(db: D1Database, changes: Changes) {
+export async function saveChanges(db: D1Database, hid: number, changes: Changes) {
   const projects = changes.projects ?? [], deleted = changes.deleted ?? [];
   if (!Array.isArray(projects) || !Array.isArray(deleted) || !deleted.every(Number.isInteger)) throw new BadRequest('Malformed changes.');
   projects.forEach(p => checkProject(p));
   const statements = [
-    ...projects.map(p => upsertProject(db, p as Project)),
-    ...deleted.map(id => db.prepare('DELETE FROM projects WHERE id = ?').bind(id)),
+    ...projects.map(p => upsertProject(db, hid, p as Project)),
+    ...deleted.map(id => db.prepare('DELETE FROM projects WHERE id = ? AND household_id = ?').bind(id, hid)),
   ];
   if (changes.settings) {
     if (typeof changes.settings !== 'object' || !Array.isArray(changes.settings.species)) throw new BadRequest('Malformed settings.');
-    statements.push(putSettings(db, changes.settings, changes.settingsUpdatedAt ?? ''));
+    statements.push(putSettings(db, hid, changes.settings, changes.settingsUpdatedAt ?? ''));
   }
   if (statements.length) await db.batch(statements);
 }
 
 /** Saves a new project, giving it the next id. */
-export async function createProject(db: D1Database, draft: unknown): Promise<Project> {
+export async function createProject(db: D1Database, hid: number, draft: unknown): Promise<Project> {
   checkProject(draft, false);
   const row = await db.prepare(`
-    INSERT INTO projects (stream, status, stage, data, calc, history, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(streamOf(draft), draft.status, draft.stage || 'ideation', json(draft.data, {}), json(draft.calc, {}),
+    INSERT INTO projects (household_id, stream, status, stage, data, calc, history, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+    .bind(hid, streamOf(draft), draft.status, draft.stage || 'ideation', json(draft.data, {}), json(draft.calc, {}),
       json(draft.history, []), draft.created_at, draft.updated_at)
     .first<{ id: number }>();
   const { stage, data, calc, history, created_at, updated_at, status } = draft;
   return { id: row!.id, stream: streamOf(draft), status, stage: stage || 'ideation', data, calc: calc ?? {}, history, created_at, updated_at };
 }
 
-/** Replaces every project and the settings with a backup file's (from this app or the original one). */
-export async function importBackup(db: D1Database, backup: any) {
+/** Replaces the household's projects and settings with a backup file's. Projects get new ids, so a
+ *  backup can't overwrite another household's. */
+export async function importBackup(db: D1Database, hid: number, backup: any) {
   if (!backup || !Array.isArray(backup.projects) || !backup.settings) throw new BadRequest('That file is not a Home Projects backup.');
   backup.projects.forEach((p: unknown) => checkProject(p));
   await db.batch([
-    db.prepare('DELETE FROM projects'),
-    db.prepare("DELETE FROM settings WHERE key = 'settings'"),
-    ...backup.projects.map((p: Project) => upsertProject(db, p)),
-    putSettings(db, backup.settings, backup.settingsUpdatedAt ?? ''),
+    db.prepare('DELETE FROM projects WHERE household_id = ?').bind(hid),
+    db.prepare("DELETE FROM settings WHERE key = 'settings:' || ?").bind(hid),
+    ...backup.projects.map((p: Project) => db.prepare(`
+      INSERT INTO projects (household_id, stream, status, stage, data, calc, history, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(hid, streamOf(p), p.status, p.stage || 'ideation',
+        json(p.data, {}), json(p.calc, {}), json(p.history, []), p.created_at, p.updated_at)),
+    putSettings(db, hid, backup.settings, backup.settingsUpdatedAt ?? ''),
   ]);
-  return getState(db);
+  return getState(db, hid);
 }

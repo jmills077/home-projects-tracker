@@ -14,12 +14,12 @@ pricing, Shopify, small-batch runs, tax set-asides). It runs on Cloudflare: a si
 
 ```sh
 npm install
-cp .dev.vars.example .dev.vars    # local sign-in password (default: home)
+cp .dev.vars.example .dev.vars    # site password for setting up the first account (default: home)
 npm run setup:local               # creates the local database
 npm run dev                       # http://localhost:8787
 ```
 
-Sign in with the password from `.dev.vars`. Local data lives in `.wrangler/state/`;
+The first visit asks you to set up an account, using the site password from `.dev.vars`. Local data lives in `.wrangler/state/`;
 `npm run db:reset:local` wipes it and starts over. Receipt reading uses Workers AI, which runs on
 Cloudflare even under `npm run dev`, so it needs `npx wrangler login`.
 
@@ -45,7 +45,7 @@ whenever the app is used. The manifest and icons are in `public/`.
 src/
   index.tsx          Hono app: sign-in, the app page, the JSON API
   env.ts             Worker bindings (DB, ASSETS, AI) and secrets
-  lib/auth.ts        Single-password sign-in with a signed session cookie
+  lib/auth.ts        Accounts, households, sessions, invite and password links
   lib/db.ts          D1 reads and writes
   lib/receipts.ts    Keeps receipt photos and reads them into line items (Workers AI)
   views/             Page templates (Hono JSX): the app page, sign-in
@@ -78,5 +78,9 @@ migrations/          D1 schema
   back to check over, then go to a project, or to the receipt itself as **Not for a project** (tools,
   supplies). **All receipts** (`#/receipts`) lists every receipt by year and downloads spending as Excel.
 - **Frozen projects** leave the board and calendar until unfrozen, keeping their phase and dates.
-- **Sign-in.** For now, one password set as the `APP_PASSWORD` secret. Accounts and shared households
-  are the next phase of work.
+- **Accounts and households.** Everyone signs in with their own email and password. Projects, receipts
+  and settings belong to a household, and everyone in it sees and edits them all (a project's history
+  says who moved it along). Settings → Household makes a one-use invite link (7 days) to send by text;
+  the owner can also make a link for someone to set a new password. Someone can be in several
+  households and switch between them. The first account is set up with the old site password
+  (`APP_PASSWORD`) and takes over everything made before accounts, in household 1.
