@@ -84,3 +84,9 @@ migrations/          D1 schema
   the owner can also make a link for someone to set a new password. Someone can be in several
   households and switch between them. The first account is set up with the old site password
   (`APP_PASSWORD`) and takes over everything made before accounts, in household 1.
+- **Sign-up for friends and family.** A site admin (the first account, and anyone they make one) turns
+  on sign-up in Settings → Site and sends out the link it gives, `/signup/<code>`. Anyone with it makes
+  an account and a household of their own. At most 5 sign-ups a day from one IP address and 50 a day in
+  all. Making a new link retires the old one; sign-up can be turned off. Site admins also see every
+  account, can delete one (with any household only that person was in), and make a password link for
+  anyone, since the site sends no email.

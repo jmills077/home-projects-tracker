@@ -4,7 +4,9 @@
 // cookie; the sessions table keeps only its SHA-256, with the household that browser is looking at.
 // People join a household through a one-use invite link; a household owner can also make a one-use
 // link for someone in it to set a new password. The very first account is made with the old
-// site-wide password (APP_PASSWORD) and takes over everything made before accounts.
+// site-wide password (APP_PASSWORD) and takes over everything made before accounts. Anyone else with
+// the site's sign-up link can make an account, which starts a household of their own; site admins
+// run that link and can make a password link for anyone (the site sends no email).
 import type { Context } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { App } from '../env';
@@ -19,10 +21,15 @@ const LINK_DAYS = 7;
 const ITERATIONS = 100_000;
 // Sign-in is refused for an email after this many wrong passwords in this many minutes.
 const MAX_FAILURES = 10, FAILURE_MINUTES = 15;
+// At most this many new accounts from one computer (IP address) a day, and from everyone a day.
+const SIGNUPS_PER_IP = 5, SIGNUPS_PER_DAY = 50;
+// The sign-up code: easy to read out, with no 0/o or 1/l to mix up.
+const CODE_LETTERS = 'abcdefghjkmnpqrstuvwxyz23456789', CODE_LENGTH = 10;
+const SIGNUP_KEY = 'site:signup';
 
 export class AuthError extends Error {}
 
-export interface User { id: number; email: string; name: string }
+export interface User { id: number; email: string; name: string; site_admin: boolean }
 export interface Household { id: number; name: string; role: string }
 export interface Member { id: number; name: string; email: string; role: string; joined_at: string }
 export interface Session { id: string; user: User; household: Household; households: Household[] }
@@ -108,16 +115,16 @@ export async function currentSession(c: Context<App>): Promise<Session | null> {
   const token = getCookie(c, COOKIE);
   if (!token) return null;
   const id = await sha256(token), db = c.env.DB;
-  const row = await db.prepare(`SELECT s.user_id, s.household_id, s.expires_at, u.email, u.name
+  const row = await db.prepare(`SELECT s.user_id, s.household_id, s.expires_at, u.email, u.name, u.site_admin
     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?`).bind(id)
-    .first<{ user_id: number; household_id: number | null; expires_at: number; email: string; name: string }>();
+    .first<{ user_id: number; household_id: number | null; expires_at: number; email: string; name: string; site_admin: number }>();
   if (!row || row.expires_at < Date.now()) return null;
   const households = await householdsOf(db, row.user_id);
   // Fall back to their first household if this one was left, or they were taken out of it.
   const household = households.find(h => h.id === row.household_id) ?? households[0];
   if (!household) {
     // Someone taken out of their last household gets a fresh one of their own.
-    await createHousehold(db, row.user_id, `${row.name.split(' ')[0] || 'My'}'s home`);
+    await createHousehold(db, row.user_id, `${firstName(row.name)}'s home`);
     return currentSession(c);
   }
   if (household.id !== row.household_id || row.expires_at - Date.now() < RENEW_DAYS * 86400000) {
@@ -125,7 +132,7 @@ export async function currentSession(c: Context<App>): Promise<Session | null> {
       .bind(household.id, Date.now() + SESSION_DAYS * 86400000, id).run();
     setCookie(c, COOKIE, token, cookieOptions(c));
   }
-  return { id, user: { id: row.user_id, email: row.email, name: row.name }, household, households };
+  return { id, user: { id: row.user_id, email: row.email, name: row.name, site_admin: !!row.site_admin }, household, households };
 }
 
 export async function switchHousehold(c: Context<App>, s: Session, householdId: number) {
@@ -178,7 +185,112 @@ export async function setUpFirstAccount(c: Context<App>, form: Record<string, un
   const userId = await createUser(db, cleanName(form.name), cleanEmail(form.email), String(form.password ?? ''));
   await db.prepare("INSERT OR IGNORE INTO households (id, name, created_at) VALUES (1, 'Our home', ?)").bind(now()).run();
   await db.prepare("INSERT INTO members (household_id, user_id, role, joined_at) VALUES (1, ?, 'owner', ?)").bind(userId, now()).run();
+  await db.prepare('UPDATE users SET site_admin = 1 WHERE id = ?').bind(userId).run();
   await startSession(c, userId, 1);
+}
+
+// ---------- signing up from the site's sign-up link ----------
+
+const firstName = (name: string) => name.split(' ')[0] || 'My';
+
+/** The site's sign-up code, or '' while sign-up is off. */
+export async function signupCode(db: D1Database) {
+  const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(SIGNUP_KEY).first<{ value: string }>();
+  return row ? String(JSON.parse(row.value).code ?? '') : '';
+}
+export async function signupCodeIs(db: D1Database, attempt: unknown) {
+  const code = await signupCode(db), tried = String(attempt ?? '').trim().toLowerCase();
+  return !!code && !!tried && await siteOldPasswordIs(code, tried);
+}
+
+/** A new account with a household of its own. Needs the sign-up code, and only so many a day. */
+export async function signUp(c: Context<App>, form: Record<string, unknown>) {
+  const db = c.env.DB;
+  if (!await signupCode(db)) throw new AuthError("Sign-up is turned off right now. Ask whoever sent you the site.");
+  if (!await signupCodeIs(db, form.code)) throw new AuthError("That sign-up code isn't right. Check the link you were sent, or ask for a new one.");
+  const ip = c.req.header('CF-Connecting-IP') ?? 'unknown', since = Date.now() - 86400000;
+  const counts = await db.prepare('SELECT count(*) AS everyone, sum(ip = ?) AS here FROM sign_ups WHERE at > ?').bind(ip, since)
+    .first<{ everyone: number; here: number | null }>();
+  if ((counts?.here ?? 0) >= SIGNUPS_PER_IP || (counts?.everyone ?? 0) >= SIGNUPS_PER_DAY)
+    throw new AuthError('A lot of accounts were made just now. Try again tomorrow.');
+  const name = cleanName(form.name);
+  const userId = await createUser(db, name, cleanEmail(form.email), String(form.password ?? ''));
+  await db.batch([
+    db.prepare('INSERT INTO sign_ups (ip, at) VALUES (?, ?)').bind(ip, Date.now()),
+    db.prepare('DELETE FROM sign_ups WHERE at < ?').bind(since),
+  ]);
+  const householdId = await createHousehold(db, userId, cleanName(form.household) || `${firstName(name)}'s home`);
+  await startSession(c, userId, householdId);
+}
+
+// ---------- running the site (site admins) ----------
+
+export interface Account { id: number; name: string; email: string; created_at: string; site_admin: number; households: string | null }
+
+function mustBeAdmin(s: Session) {
+  if (!s.user.site_admin) throw new AuthError('Only a site admin can do that.');
+}
+
+/** What the Site card in Settings shows: the sign-up link and every account. */
+export async function siteState(c: Context<App>, s: Session) {
+  mustBeAdmin(s);
+  const db = c.env.DB, code = await signupCode(db);
+  const accounts = (await db.prepare(`SELECT u.id, u.name, u.email, u.created_at, u.site_admin,
+      (SELECT group_concat(h.name, ', ') FROM members m JOIN households h ON h.id = m.household_id WHERE m.user_id = u.id) AS households
+    FROM users u ORDER BY u.id`).all<Account>()).results;
+  return { signupUrl: code ? `${new URL(c.req.url).origin}/signup/${code}` : '', accounts };
+}
+
+/** Makes a new sign-up code (so the old link stops working), or turns sign-up off. */
+export async function setSignup(c: Context<App>, s: Session, on: boolean) {
+  mustBeAdmin(s);
+  const code = on ? [...crypto.getRandomValues(new Uint8Array(CODE_LENGTH))].map(b => CODE_LETTERS[b % CODE_LETTERS.length]).join('') : '';
+  await c.env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+    .bind(SIGNUP_KEY, JSON.stringify({ code, updatedAt: now() })).run();
+  return siteState(c, s);
+}
+
+export async function makeSiteAdmin(c: Context<App>, s: Session, userId: number) {
+  mustBeAdmin(s);
+  const r = await c.env.DB.prepare('UPDATE users SET site_admin = 1 WHERE id = ?').bind(userId).run();
+  if (!r.meta.changes) throw new AuthError('There is no such account.');
+  return siteState(c, s);
+}
+
+/** A link for anyone to set a new password, for when they've forgotten it and nobody in their household can help. */
+export async function makeSiteResetLink(c: Context<App>, s: Session, userId: number) {
+  mustBeAdmin(s);
+  const db = c.env.DB;
+  const home = await db.prepare('SELECT household_id FROM members WHERE user_id = ? ORDER BY joined_at LIMIT 1').bind(userId).first<{ household_id: number }>();
+  if (!home) throw new AuthError('There is no such account.');
+  const token = randomToken();
+  await db.prepare("INSERT INTO links (id, kind, household_id, user_id, created_by, expires_at, created_at) VALUES (?, 'reset', ?, ?, ?, ?, ?)")
+    .bind(await sha256(token), home.household_id, userId, s.user.id, Date.now() + LINK_DAYS * 86400000, now()).run();
+  return { url: `${new URL(c.req.url).origin}/reset/${token}`, days: LINK_DAYS };
+}
+
+/** Deletes an account (a junk one, or someone who asked), with any household only they were in and its projects and receipts. */
+export async function deleteAccount(c: Context<App>, s: Session, userId: number) {
+  mustBeAdmin(s);
+  if (userId === s.user.id) throw new AuthError("You can't delete your own account here.");
+  const db = c.env.DB;
+  const alone = (await db.prepare(`SELECT household_id AS id FROM members m WHERE user_id = ?
+    AND (SELECT count(*) FROM members o WHERE o.household_id = m.household_id) = 1`).bind(userId).all<{ id: number }>()).results.map(r => r.id);
+  await db.batch([
+    ...alone.flatMap(id => [
+      db.prepare('DELETE FROM projects WHERE household_id = ?').bind(id),
+      db.prepare('DELETE FROM receipts WHERE household_id = ?').bind(id),
+      db.prepare("DELETE FROM settings WHERE key = 'settings:' || ?").bind(id),
+      db.prepare('DELETE FROM links WHERE household_id = ?').bind(id),
+      db.prepare('DELETE FROM members WHERE household_id = ?').bind(id),
+      db.prepare('DELETE FROM households WHERE id = ?').bind(id),
+    ]),
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+    db.prepare('DELETE FROM members WHERE user_id = ?').bind(userId),
+    db.prepare('UPDATE links SET used_at = ? WHERE user_id = ? AND used_at IS NULL').bind(now(), userId),
+    db.prepare('DELETE FROM users WHERE id = ?').bind(userId),
+  ]);
+  return siteState(c, s);
 }
 
 // ---------- invite and reset links ----------

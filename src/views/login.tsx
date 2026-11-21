@@ -30,8 +30,9 @@ export const LoginPage = ({ error, email, next }: { error?: string; email?: stri
       <Field label="Password" name="password" type="password" auto="current-password" />
       <p><button class="btn primary" type="submit">Sign in</button></p>
     </form>
-    <p class="muted small">New here? Ask someone in your household for an invite link.
-      Forgot your password? The household owner can make you a link to set a new one, from Settings.</p>
+    <p class="muted small">New here? <a href="/signup">Make an account</a> with the sign-up link you were sent, or ask
+      someone in your household for an invite link to share theirs.</p>
+    <p class="muted small">Forgot your password? Ask your household's owner, or whoever sent you the site, for a link to set a new one.</p>
   </Shell>
 );
 
@@ -54,6 +55,35 @@ export const SetupPage = ({ error, name, email, noSitePassword }: { error?: stri
         <p><button class="btn primary" type="submit">Make my account</button></p>
       </form>
     </>)}
+  </Shell>
+);
+
+/** Anyone with the site's sign-up link: an account and a household of their own. */
+export const SignUpPage = ({ open, code, error, name, email, household }: {
+  open: boolean; code?: string; error?: string; name?: string; email?: string; household?: string;
+}) => (
+  <Shell title="Make an account">
+    <h1>Make an account</h1>
+    {open ? (<>
+      <p>Home Projects keeps your house projects and woodworking builds in one place: budgets and what you've spent,
+        to-do and shopping lists, cut lists, receipts and a calendar. Your projects are your own. Invite the people
+        you live with from Settings once you're in.</p>
+      <Err error={error} />
+      <form method="post" action="/signup">
+        {code ? <input type="hidden" name="code" value={code} />
+          : <Field label="Sign-up code (from the link you were sent)" name="code" auto="off" />}
+        <Field label="Your name" name="name" auto="name" value={name} />
+        <Field label="Email" name="email" type="email" auto="username" value={email} hint="You sign in with it. Nothing is ever emailed to you." />
+        <Field label="Password" name="password" type="password" auto="new-password" hint="At least 8 characters." />
+        <label class="f"><span>Name for your household (optional)</span>
+          <input name="household" value={household} placeholder="The Smith house" autocomplete="off" /></label>
+        <p><button class="btn primary" type="submit">Make my account</button></p>
+      </form>
+    </>) : (
+      <p>Sign-up is turned off right now. Ask whoever sent you the site for a sign-up link, or ask someone in your
+        household for an invite link.</p>
+    )}
+    <p class="muted small">Already have an account? <a href="/login">Sign in</a>.</p>
   </Shell>
 );
 

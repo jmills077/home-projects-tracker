@@ -62,7 +62,7 @@ function cutBoardFeet(p) {
 // ---------- storage (the database, through the server) ----------
 // The page arrives with the projects embedded in it; changes are sent back to the server.
 // Who's signed in, the household they're looking at, the others in it, and their other households.
-let account = { me: { id: 0, name: '', email: '' }, household: { id: 0, name: '', role: 'member' }, households: [], members: [] };
+let account = { me: { id: 0, name: '', email: '', site_admin: false }, household: { id: 0, name: '', role: 'member' }, households: [], members: [] };
 let store = loadStore(JSON.parse(document.getElementById('initialState').textContent));
 const myName = () => account.me.name.split(' ')[0] || account.me.name;
 
@@ -3026,6 +3026,74 @@ function householdCards() {
     </div>`;
 }
 
+// ---------- running the site ----------
+// Site admins only: the sign-up link to send friends and family, and every account on the site.
+const siteCard = () => account.me.site_admin ? `
+    <div class="card" id="siteCard"><h2>Site</h2><div id="siteBody"><p class="muted" style="margin:0">Loading&hellip;</p></div></div>` : '';
+
+function drawSite(site) {
+  const body = $('#siteBody');
+  if (!body) return;
+  const me = account.me.id;
+  body.innerHTML = `
+    <p class="muted" style="margin-top:0">Anyone with the sign-up link can make an account, which starts a household of their own.
+      Send it to the friends and family you want on the site.</p>
+    ${site.signupUrl ? `<div class="note ok linkshare"><b>Sign-up link</b>
+        <input readonly value="${esc(site.signupUrl)}" aria-label="Sign-up link">
+        <div class="actions">${navigator.share ? '<button class="btn small primary" data-share>Share…</button>' : ''}<button class="btn small" data-copy>Copy link</button></div>
+        <small>Works for anyone, as many times as you like, until you make a new one or turn sign-up off.</small></div>
+      <div class="actions"><button class="btn" data-signup="new">Make a new link</button><button class="btn" data-signup="off">Turn off sign-up</button></div>`
+      : `<p>Sign-up is off: nobody can make an account except through a household invite.</p>
+      <div class="actions"><button class="btn primary" data-signup="new">Turn on sign-up and make a link</button></div>`}
+    <h3>Accounts (${site.accounts.length})</h3>
+    <ul class="people">${site.accounts.map(a => `<li>
+      <span class="who"><b>${esc(a.name)}</b>${a.id === me ? ' (you)' : ''}${a.site_admin ? ' · site admin' : ''}<small>${esc(a.email)} · ${esc(a.households || 'no household')} · joined ${esc(fmtDate(a.created_at))}</small></span>
+      <span class="acts">${a.id === me ? '' : `
+        <button class="link" data-sreset="${a.id}">Password link</button>
+        ${a.site_admin ? '' : `<button class="link" data-sadmin="${a.id}">Make site admin</button>`}
+        <button class="link danger" data-sdelete="${a.id}">Delete</button>`}</span></li>`).join('')}</ul>
+    <div id="siteLinkBox" hidden></div>
+    <p class="muted small" style="margin-bottom:0">The site sends no email, so when someone forgets their password, make them a password link here and text it to them.</p>`;
+  const input = body.querySelector('.linkshare input');
+  input?.addEventListener('focus', () => input.select());
+  body.querySelector('[data-copy]')?.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(site.signupUrl); toast('Link copied'); } catch { input.focus(); input.select(); }
+  });
+  body.querySelector('[data-share]')?.addEventListener('click', () => navigator.share({ title: 'Home Projects', url: site.signupUrl }).catch(() => {}));
+}
+
+async function wireSiteCard() {
+  const card = $('#siteCard');
+  if (!card) return;
+  drawSite(await accountCall('/api/site'));
+  card.addEventListener('click', async e => {
+    const b = (e.target as Element).closest<HTMLElement>('button');
+    if (!b) return;
+    if (b.dataset.signup === 'new') {
+      if ($('#siteBody .linkshare') && !confirm('Make a new sign-up link? The old one stops working, but accounts already made stay.')) return;
+      drawSite(await accountCall('/api/site/signup', { on: true }));
+    }
+    if (b.dataset.signup === 'off' && confirm('Turn off sign-up? The link stops working. Household invites still work.'))
+      drawSite(await accountCall('/api/site/signup', { on: false }));
+    const who = () => b.closest('li').querySelector('b').textContent;
+    if (b.dataset.sreset) {
+      const out = await accountCall(`/api/site/accounts/${b.dataset.sreset}/reset-link`);
+      const box = $('#siteLinkBox');
+      box.hidden = false;
+      box.innerHTML = `<div class="note ok linkshare"><b>New password for ${esc(who())}</b>
+        <input readonly value="${esc(out.url)}" aria-label="Link"><div class="actions"><button class="btn small" data-copylink>Copy link</button></div>
+        <small>Send this to ${esc(who().split(' ')[0])}. Opening it lets them set a new password. It works once and lasts ${out.days} days.</small></div>`;
+      box.querySelector('[data-copylink]').addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(out.url); toast('Link copied'); } catch { box.querySelector('input').select(); }
+      });
+    }
+    if (b.dataset.sadmin && confirm(`Make ${who()} a site admin? They'll see every account and can make sign-up and password links.`))
+      drawSite(await accountCall(`/api/site/accounts/${b.dataset.sadmin}/admin`));
+    if (b.dataset.sdelete && confirm(`Delete ${who()}'s account? Any household only they are in is deleted too, with its projects and receipts. This can't be undone.`))
+      drawSite(await accountCall(`/api/site/accounts/${b.dataset.sdelete}/delete`));
+  });
+}
+
 function showLink(title, out, note) {
   const box = $('#linkBox');
   box.hidden = false;
@@ -3099,6 +3167,7 @@ function showSettings() {
   view.innerHTML = `
     <div class="pagehead"><h1>Settings</h1><span class="spacer"></span><span class="muted">Changes save automatically</span></div>
     ${householdCards()}
+    ${siteCard()}
     <div class="card" id="general">
       <fieldset><h2>Lumber</h2><div class="grid">
         ${inp('Waste allowance (%)', 'waste_pct', 'number', 'w3')}
@@ -3116,6 +3185,7 @@ function showSettings() {
     </div>
 `;
   wireHouseholdCards();
+  wireSiteCard().catch(() => {});
 
   $('#general').addEventListener('input', e => {
     if (!e.target.dataset.path) return;
