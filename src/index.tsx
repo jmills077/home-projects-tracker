@@ -2,6 +2,7 @@
 //
 //   GET  /                the app page, with the household's projects embedded (src/views/app.tsx)
 //   /login, /setup        signing in; the first account is set up with the old site password
+//   /signup/:code         anyone with the site's sign-up link makes an account and a household of their own
 //   /join/:token          joining a household from an invite link; /reset/:token sets a new password
 //   /api/*                JSON the browser script saves and reloads through
 //   /api/receipts/scan    keeps a receipt photo and reads it into line items (Workers AI)
@@ -13,14 +14,15 @@ import { csrf } from 'hono/csrf';
 import { HTTPException } from 'hono/http-exception';
 import type { App } from './env';
 import {
-  AuthError, changePassword, cleanEmail, cleanName, createHousehold, currentSession, endSession, hasAnyUser, joinAsNewUser,
-  joinAsSignedIn, makeLink, makeOwner, membersOf, readLink, removeMember, renameHousehold, resetPassword, setUpFirstAccount,
-  signIn, switchHousehold, updateProfile, type Session,
+  AuthError, changePassword, cleanEmail, cleanName, createHousehold, currentSession, deleteAccount, endSession, hasAnyUser,
+  joinAsNewUser, joinAsSignedIn, makeLink, makeOwner, makeSiteAdmin, makeSiteResetLink, membersOf, readLink, removeMember,
+  renameHousehold, resetPassword, setSignup, setUpFirstAccount, signIn, signUp, signupCode, signupCodeIs, siteState,
+  switchHousehold, updateProfile, type Session,
 } from './lib/auth';
 import { BadRequest, createProject, getState, importBackup, saveChanges } from './lib/db';
 import { deleteReceipt, keepPhoto, listReceipts, removePhoto, readPhoto, ReceiptError, saveReceipt, scanReceipt } from './lib/receipts';
 import { AppPage } from './views/app';
-import { DeadLinkPage, JoinPage, LoginPage, ResetPage, SetupPage } from './views/login';
+import { DeadLinkPage, JoinPage, LoginPage, ResetPage, SetupPage, SignUpPage } from './views/login';
 
 const app = new Hono<App>();
 
@@ -42,7 +44,7 @@ const form = async (c: Context<App>) => await c.req.parseBody() as Record<string
 app.use(csrf());
 
 // ---------- signing in ----------
-const OPEN = /^\/(login|setup|logout|join\/[\w-]+|reset\/[\w-]+)$/;
+const OPEN = /^\/(login|setup|logout|signup|signup\/[\w-]+|join\/[\w-]+|reset\/[\w-]+)$/;
 app.use(async (c, next) => {
   const path = c.req.path;
   const session = await currentSession(c);
@@ -75,6 +77,28 @@ app.post('/setup', async c => {
   catch (e) { if (e instanceof AuthError) return c.html(<SetupPage error={e.message} name={cleanName(f.name)} email={cleanEmail(f.email)} />, 400); throw e; }
   return c.redirect('/');
 });
+
+// The site's sign-up link. Without the code in it, the page asks for the code (or says sign-up is off).
+const signupPage = async (c: Context<App>, code?: string) => {
+  if (c.get('session')) return c.redirect('/');
+  const db = c.env.DB, open = !!await signupCode(db);
+  return c.html(<SignUpPage open={open} code={open && await signupCodeIs(db, code) ? code : undefined} />);
+};
+app.get('/signup', c => signupPage(c));
+app.get('/signup/:code', c => signupPage(c, c.req.param('code')));
+const signupPost = async (c: Context<App>) => {
+  const f = await form(c);
+  try { await signUp(c, f); }
+  catch (e) {
+    if (!(e instanceof AuthError)) throw e;
+    const db = c.env.DB, open = !!await signupCode(db);
+    return c.html(<SignUpPage open={open} code={open && await signupCodeIs(db, f.code) ? f.code : undefined} error={e.message}
+      name={cleanName(f.name)} email={cleanEmail(f.email)} household={cleanName(f.household)} />, 400);
+  }
+  return c.redirect('/');
+};
+app.post('/signup', signupPost);
+app.post('/signup/:code', signupPost);
 
 // Invite links: a new person makes an account here; someone signed in just joins.
 app.get('/join/:token', async c => {
@@ -151,6 +175,13 @@ accountRoute('/api/invites', (c, s) => makeLink(c, s, 'join'));
 accountRoute('/api/members/:id/reset-link', (c, s) => makeLink(c, s, 'reset', memberId(c)));
 accountRoute('/api/members/:id/remove', (c, s) => removeMember(c.env.DB, s, memberId(c)).then(() => undefined));
 accountRoute('/api/members/:id/owner', (c, s) => makeOwner(c.env.DB, s, memberId(c)).then(() => undefined));
+
+// ---------- running the site (site admins only) ----------
+accountRoute('/api/site', (c, s) => siteState(c, s));
+accountRoute('/api/site/signup', (c, s, b) => setSignup(c, s, !!b.on));
+accountRoute('/api/site/accounts/:id/admin', (c, s) => makeSiteAdmin(c, s, memberId(c)));
+accountRoute('/api/site/accounts/:id/reset-link', (c, s) => makeSiteResetLink(c, s, memberId(c)));
+accountRoute('/api/site/accounts/:id/delete', (c, s) => deleteAccount(c, s, memberId(c)));
 
 // ---------- receipts ----------
 // The browser sends a shrunken photo as a data URL with an id it made for the receipt. The photo is
